@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="Docs/quick-action-logo.png" width="300" alt="Quick Action logo">
+  <img src="Docs/nagra.png" width="360" alt="Nagra IV-S tape recorder">
 </p>
 
 # Audio Quick Actions
@@ -82,8 +82,6 @@ Delete `Peak Normalize.workflow` from `~/Library/Services`.
 ## License
 
 This project is distributed under the **GPL-3.0-or-later** license — see [LICENSE](LICENSE).
-
-The Quick Action logo is © At The Zoo srl and is not covered by this license.
 
 ## Author
 
