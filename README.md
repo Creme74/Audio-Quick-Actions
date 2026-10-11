@@ -18,6 +18,8 @@ More Quick Actions are coming (Loudness Normalize is next).
 
 Normalizes the peak level of your audio files to the level you choose, while keeping everything else exactly as it was.
 
+![Peak Normalize preview](Docs/peak-normalize-screenshot.png)
+
 ### Features
 
 - **Choose your target level**: 0 dB, -0.1 dB, -0.2 dB, -0.5 dB or -1 dB
