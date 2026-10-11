@@ -1,460 +1,129 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>AMApplicationBuild</key>
-	<string>523</string>
-	<key>AMApplicationVersion</key>
-	<string>2.10</string>
-	<key>AMDocumentVersion</key>
-	<string>2</string>
-	<key>actions</key>
-	<array>
-		<dict>
-			<key>action</key>
-			<dict>
-				<key>AMAccepts</key>
-				<dict>
-					<key>Container</key>
-					<string>List</string>
-					<key>Optional</key>
-					<true/>
-					<key>Types</key>
-					<array>
-						<string>com.apple.cocoa.string</string>
-					</array>
-				</dict>
-				<key>AMActionVersion</key>
-				<string>2.0.3</string>
-				<key>AMApplication</key>
-				<array>
-					<string>Automator</string>
-				</array>
-				<key>AMParameterProperties</key>
-				<dict>
-					<key>COMMAND_STRING</key>
-					<dict/>
-					<key>CheckedForUserDefaultShell</key>
-					<dict/>
-					<key>inputMethod</key>
-					<dict/>
-					<key>shell</key>
-					<dict/>
-					<key>source</key>
-					<dict/>
-				</dict>
-				<key>AMProvides</key>
-				<dict>
-					<key>Container</key>
-					<string>List</string>
-					<key>Types</key>
-					<array>
-						<string>com.apple.cocoa.string</string>
-					</array>
-				</dict>
-				<key>ActionBundlePath</key>
-				<string>/System/Library/Automator/Run Shell Script.action</string>
-				<key>ActionName</key>
-				<string>Run Shell Script</string>
-				<key>ActionParameters</key>
-				<dict>
-					<key>COMMAND_STRING</key>
-					<string>#!/bin/zsh
-# Peak Normalize — macOS Finder Quick Action that peak-normalizes lossless audio files.
+#!/bin/zsh
+# Analyze Loudness — macOS Finder Quick Action that measures the loudness of audio files.
 #
-# - Asks for the target peak level, then whether to overwrite the original files
-#   or duplicate them into a "Normalized" subfolder of the source folder.
-# - Lossless formats only: WAV, AIFF/AIF/AIFC, CAF (uncompressed PCM) and FLAC.
-#   Lossy files (MP3, AAC/M4A...) are skipped.
-# - File type, bit depth (8/16/24/32-bit, integer or float) and sample rate are kept.
-# - Files already at the requested level are not re-processed (only their date is updated).
-# - WAV / AIFF / CAF: the result is a byte-for-byte copy of the original in which only
-#   the audio samples are replaced, so Apple Loops metadata (tempo, key, tags,
-#   transients), markers, ID3 tags, Finder tags and Spotlight comments are preserved.
-# - FLAC: re-encoded to FLAC with ffmpeg, keeping tags and cover art.
-# - Several files are processed in parallel.
+# - Measures integrated loudness (LUFS), true peak (dBTP) and loudness range (LU)
+#   with the ITU-R BS.1770 / EBU R128 method, the standard Spotify uses.
+# - Shows the gain Spotify would apply to each file in its three volume modes
+#   (Loud -11, Normal -14, Quiet -19 LUFS), track by track: loud files are turned
+#   down; quiet files are turned up only as far as the true peak allows (Spotify
+#   keeps 1 dB of headroom), except in Loud mode, where a limiter is used.
+# - Any audio format ffmpeg can read (WAV, AIFF, CAF, FLAC, ALAC, MP3, AAC/M4A...).
+#   Nothing is modified.
 #
-# Requires sox (WAV/AIFF/CAF) and ffmpeg (FLAC only). Runs with /bin/zsh.
+# Requires ffmpeg. Runs with /bin/zsh.
 
-levels=(0 -0.1 -0.2 -0.5 -1)   # target peak levels offered, in dBFS
-default_level=0
-tolerance=0.01                 # dB: files this close to the target are left as is
-copydir="Normalized"           # subfolder used by "Duplicate"
-
+FFMPEG=""
+for p in /opt/homebrew/bin/ffmpeg /usr/local/bin/ffmpeg; do
+  [[ -x $p ]] && { FFMPEG=$p; break; }
+done
 export LC_NUMERIC=C
 
-# A native (Homebrew) sox is preferred: the standalone 2015 build is Intel-only
-# and runs through Rosetta on Apple Silicon.
-SOX="" FFMPEG=""
-for p in /opt/homebrew/bin/sox /usr/local/bin/sox /Applications/sox/sox; do
-  [[ -x $p ]] &amp;&amp; { SOX=$p; break; }
-done
-for p in /opt/homebrew/bin/ffmpeg /usr/local/bin/ffmpeg; do
-  [[ -x $p ]] &amp;&amp; { FFMPEG=$p; break; }
-done
-
-tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/peaknorm.XXXXXX") || exit 1
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/loudness.XXXXXX") || exit 1
 trap 'rm -rf "$tmpdir"' EXIT
-pl="$tmpdir/afmeta.pl"
-
-# --- File structure helper -------------------------------------------------------
-#   scan FILE...                 one line per file: "pcm ENC BITS ENDIAN OFFSET LENGTH
-#                                CHANNELS RATE", "flac BITS RATE", "lossy",
-#                                "compressed", "unreadable" or "none"
-#   extract FILE OFFSET LENGTH   writes the audio bytes to stdout
-#   splice FILE OFFSET LENGTH RAW  overwrites the audio bytes with RAW (same size)
-#   flacinfo FILE                prints "BITS RATE"
-cat &gt; "$pl" &lt;&lt;'PERL'
-use strict; use warnings;
-my $mode = shift @ARGV // '';
-
-if ($mode eq 'scan') {
-    for my $path (@ARGV) { print scan_one($path), "\n" }
-    exit 0;
-}
-if ($mode eq 'extract') {
-    my ($path, $off, $len) = @ARGV;
-    open(my $in, '&lt;:raw', $path) or exit 1;
-    binmode STDOUT;
-    seek($in, $off, 0) or exit 1;
-    my $buf;
-    while ($len &gt; 0) {
-        my $n = read($in, $buf, $len &lt; 1048576 ? $len : 1048576) or last;
-        print STDOUT $buf or exit 1;
-        $len -= $n;
-    }
-    exit($len == 0 ? 0 : 1);
-}
-if ($mode eq 'splice') {
-    my ($path, $off, $len, $raw) = @ARGV;
-    (-s $raw || 0) == $len or exit 3;
-    open(my $out, '+&lt;:raw', $path) or exit 1;
-    open(my $in,  '&lt;:raw',  $raw)  or exit 1;
-    seek($out, $off, 0) or exit 1;
-    my $buf;
-    while (read($in, $buf, 1048576)) { print {$out} $buf or exit 1 }
-    close($out) or exit 1;
-    exit 0;
-}
-if ($mode eq 'flacinfo') {
-    my @r = eval { open(my $fh, '&lt;:raw', $ARGV[0]) or die "open\n"; flac($fh) };
-    print @r ? "$r[1] $r[2]\n" : "?\n";
-    exit 0;
-}
-exit 1;
-
-sub scan_one {
-    my ($path) = @_;
-    return 'none' unless -f $path;
-    return 'lossy' unless $path =~ /\.(wav|aiff?|aifc|caf|flac)\z/i;
-    my $is_flac = lc($1) eq 'flac';
-    my @r = eval {
-        open(my $fh, '&lt;:raw', $path) or die "open\n";
-        return flac($fh) if $is_flac;
-        my $size = -s $fh;
-        read($fh, my $hdr, 12) == 12 or die "short\n";
-        my $id = substr($hdr, 0, 4);
-        return $id eq 'FORM' ? aiff($fh, $size, substr($hdr, 8, 4))
-             : ($id eq 'RIFF' || $id eq 'RF64' || $id eq 'BW64') ? wav($fh, $size, substr($hdr, 8, 4))
-             : $id eq 'caff' ? caf($fh, $size)
-             : die "container\n";
-    };
-    return join(' ', @r) if @r;
-    return $@ =~ /^codec/ ? 'compressed' : 'unreadable';
-}
-
-sub clamp_len {   # bytes actually present, rounded down to whole frames
-    my ($size, $off, $len, $frame) = @_;
-    $len = $size - $off if $off + $len &gt; $size;
-    die "frame\n" if $frame &lt;= 0 || $len &lt; 0;
-    return $len - ($len % $frame);
-}
-sub rate_ok { my $r = sprintf('%.0f', $_[0] || 0); $r &gt;= 1000 &amp;&amp; $r &lt;= 1536000 ? $r : 44100 }
-
-sub aiff {
-    my ($fh, $size, $form) = @_;
-    $form eq 'AIFF' || $form eq 'AIFC' or die "form\n";
-    my ($ch, $frames, $bits, $rate, $comp, $soff, $slen);
-    my $pos = 12;
-    while ($pos + 8 &lt;= $size) {
-        seek($fh, $pos, 0); read($fh, my $h, 8) == 8 or last;
-        my ($cid, $clen) = unpack('a4 N', $h);
-        if ($cid eq 'COMM') {
-            read($fh, my $c, $clen &lt; 64 ? $clen : 64);
-            length($c) &gt;= 18 or die "comm\n";
-            ($ch, $frames, $bits) = unpack('n N n', $c);
-            my ($e, $hi, $lo) = unpack('n N N', substr($c, 8, 10));
-            $rate = ($hi * 4294967296 + $lo) * 2 ** (($e &amp; 0x7FFF) - 16383 - 63);
-            $comp = ($form eq 'AIFC' &amp;&amp; length($c) &gt;= 22) ? substr($c, 18, 4) : 'NONE';
-        } elsif ($cid eq 'SSND') {
-            read($fh, my $s, 8) == 8 or die "ssnd\n";
-            my ($o) = unpack('N', $s);
-            ($soff, $slen) = ($pos + 16 + $o, $clen - 8 - $o);
-        }
-        $pos += 8 + $clen + ($clen &amp; 1);
-    }
-    defined $ch &amp;&amp; defined $soff &amp;&amp; $ch &gt; 0 or die "chunks\n";
-    my %c = (NONE =&gt; ['signed-integer', 'B'], twos =&gt; ['signed-integer', 'B'],
-             sowt =&gt; ['signed-integer', 'L'], in24 =&gt; ['signed-integer', 'B', 24],
-             in32 =&gt; ['signed-integer', 'B', 32], '23ni' =&gt; ['signed-integer', 'L', 24],
-             fl32 =&gt; ['floating-point', 'B', 32], FL32 =&gt; ['floating-point', 'B', 32],
-             fl64 =&gt; ['floating-point', 'B', 64], FL64 =&gt; ['floating-point', 'B', 64]);
-    my $e = $c{$comp} or die "codec $comp\n";
-    my $bytes = int((($e-&gt;[2] // $bits) + 7) / 8);
-    my $len = $frames * $ch * $bytes;
-    $len = $slen if $slen &lt; $len;
-    return ('pcm', $e-&gt;[0], 8 * $bytes, $e-&gt;[1], $soff,
-            clamp_len($size, $soff, $len, $ch * $bytes), $ch, rate_ok($rate));
-}
-
-sub wav {
-    my ($fh, $size, $wave) = @_;
-    $wave eq 'WAVE' or die "wave\n";
-    my ($fmt, $doff, $dlen, $ds64);
-    my $pos = 12;
-    while ($pos + 8 &lt;= $size) {
-        seek($fh, $pos, 0); read($fh, my $h, 8) == 8 or last;
-        my ($cid, $clen) = unpack('a4 V', $h);
-        if ($cid eq 'ds64') {
-            read($fh, my $d, 16) == 16 or die "ds64\n";
-            my (undef, undef, $lo, $hi) = unpack('V4', $d);
-            $ds64 = $hi * 4294967296 + $lo;
-        } elsif ($cid eq 'fmt ') {
-            read($fh, $fmt, $clen &lt; 40 ? $clen : 40);
-        } elsif ($cid eq 'data' &amp;&amp; !defined $doff) {
-            $clen = $ds64 if $clen == 0xFFFFFFFF &amp;&amp; defined $ds64;
-            ($doff, $dlen) = ($pos + 8, $clen);
-        }
-        $pos += 8 + $clen + ($clen &amp; 1);
-    }
-    defined $fmt &amp;&amp; defined $doff &amp;&amp; length($fmt) &gt;= 16 or die "chunks\n";
-    my ($tag, $ch, $rate, undef, $align, $bits) = unpack('v v V V v v', $fmt);
-    $tag = unpack('v', substr($fmt, 24, 2)) if $tag == 0xFFFE &amp;&amp; length($fmt) &gt;= 26;
-    $ch &gt; 0 &amp;&amp; $align &gt; 0 &amp;&amp; $align % $ch == 0 or die "fmt\n";
-    my $bytes = $align / $ch;
-    my $enc = $tag == 3 ? 'floating-point'
-            : $tag == 1 ? ($bytes == 1 ? 'unsigned-integer' : 'signed-integer')
-            : die "codec $tag\n";
-    return ('pcm', $enc, 8 * $bytes, 'L', $doff,
-            clamp_len($size, $doff, $dlen, $align), $ch, rate_ok($rate));
-}
-
-sub caf {
-    my ($fh, $size) = @_;
-    my ($desc, $doff, $dlen);
-    my $pos = 8;
-    while ($pos + 12 &lt;= $size) {
-        seek($fh, $pos, 0); read($fh, my $h, 12) == 12 or last;
-        my ($cid, $hi, $lo) = unpack('a4 N N', $h);
-        my $clen = ($hi == 0xFFFFFFFF &amp;&amp; $lo == 0xFFFFFFFF) ? $size - $pos - 12
-                 : $hi * 4294967296 + $lo;
-        if ($cid eq 'desc') { read($fh, $desc, 32) == 32 or die "desc\n" }
-        elsif ($cid eq 'data') { ($doff, $dlen) = ($pos + 16, $clen - 4) }
-        $pos += 12 + $clen;
-    }
-    defined $desc &amp;&amp; defined $doff or die "chunks\n";
-    my ($rate, $fid, $flags, $bpp, undef, $ch) = unpack('d&gt; a4 N N N N', $desc);
-    $fid eq 'lpcm' or die "codec $fid\n";
-    $ch &gt; 0 &amp;&amp; $bpp &gt; 0 &amp;&amp; $bpp % $ch == 0 or die "desc\n";
-    my $enc = ($flags &amp; 1) ? 'floating-point' : 'signed-integer';
-    my $end = ($flags &amp; 2) ? 'L' : 'B';
-    return ('pcm', $enc, 8 * $bpp / $ch, $end, $doff,
-            clamp_len($size, $doff, $dlen, $bpp), $ch, rate_ok($rate));
-}
-
-sub flac {   # STREAMINFO, after an optional ID3v2 tag
-    my ($fh) = @_;
-    read($fh, my $h, 10) == 10 or die "short\n";
-    my $pos = 0;
-    if (substr($h, 0, 3) eq 'ID3') {
-        my @s = unpack('C4', substr($h, 6, 4));
-        $pos = 10 + (($s[0] &lt;&lt; 21) | ($s[1] &lt;&lt; 14) | ($s[2] &lt;&lt; 7) | $s[3]);
-        $pos += 10 if ord(substr($h, 5, 1)) &amp; 0x10;
-    }
-    seek($fh, $pos, 0); read($fh, my $b, 42) == 42 or die "short\n";
-    substr($b, 0, 4) eq 'fLaC' &amp;&amp; (ord(substr($b, 4, 1)) &amp; 0x7F) == 0 or die "flac\n";
-    my @s = unpack('C*', substr($b, 8, 34));
-    my $rate = ($s[10] &lt;&lt; 12) | ($s[11] &lt;&lt; 4) | ($s[12] &gt;&gt; 4);
-    my $bits = ((($s[12] &amp; 1) &lt;&lt; 4) | ($s[13] &gt;&gt; 4)) + 1;
-    return ('flac', $bits, $rate);
-}
-PERL
 
 notify() {
   /usr/bin/osascript -e 'on run argv' \
     -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
-    -e 'end run' "$1" "$2" &gt;/dev/null 2&gt;&amp;1
-}
-alert() {
-  /usr/bin/osascript -e 'on run argv' \
-    -e 'display alert (item 1 of argv) message (item 2 of argv) as warning' \
-    -e 'end run' "$1" "$2" &gt;/dev/null 2&gt;&amp;1
-}
-plural() {   # plural 3 file -&gt; "3 files"
-  if (( $1 == 1 )); then print -r -- "$1 $2"; else print -r -- "$1 $2s"; fi
+    -e 'end run' "$1" "$2" >/dev/null 2>&1
 }
 
-# --- Jobs ------------------------------------------------------------------------
-# Each job runs in the background and writes one line to $tmpdir/&lt;n&gt;.res:
-#   "ok", "same" (already at the requested level) or "err &lt;message&gt;".
-
-# The audio is not touched, but the modification date is set to now, like for
-# the files that were normalized.
-keep_as_is() {   # src out partial res — file already at the requested level
-  if [[ $mode == duplicate ]]; then
-    if ! { cp -p "$1" "$3" &amp;&amp; touch "$3" &amp;&amp; mv -f "$3" "$2"; }; then
-      rm -f "$3"; print -r -- "err could not copy the file" &gt; "$4"; return
-    fi
-  else
-    touch "$1"
-  fi
-  print same &gt; "$4"
-}
-
-# WAV / AIFF / CAF. A single sox run measures the peak ("stat") and renders the
-# normalized samples ("--norm") as raw audio in exactly the original sample format;
-# they are then written over the audio data of an exact copy of the original.
-pcm_job() {   # n src out partial enc bits endian offset length channels rate
-  local n=$1 src=$2 out=$3 part=$4 off=$8 len=$9
-  local raw="$tmpdir/$n.raw" st="$tmpdir/$n.stat" res="$tmpdir/$n.res" verdict
-  local -a fmt
-  fmt=(-t raw -e "$5" -b "$6" "-$7")
-
-  [[ -n $SOX ]] || { print -r -- "err sox not found" &gt; "$res"; return; }
-  if ! /usr/bin/perl "$pl" extract "$src" "$off" "$len" \
-     | "$SOX" -V1 --norm="$level" "${fmt[@]}" -c "${10}" -r "${11}" - "${fmt[@]}" "$raw" \
-         stat 2&gt; "$st"; then
-    rm -f "$raw"; print -r -- "err sox failed" &gt; "$res"; return
-  fi
-
-  verdict=$(awk -v t="$level" -v tol="$tolerance" '
-    /^Maximum amplitude/ { mx = $3; seen = 1 }
-    /^Minimum amplitude/ { mn = $3 }
-    END {
-      if (!seen) { print "err"; exit }
-      a = mx &lt; 0 ? -mx : mx; b = mn &lt; 0 ? -mn : mn; p = a &gt; b ? a : b
-      if (p &lt;= 0) { print "silent"; exit }
-      d = t - 20 * log(p) / log(10); if (d &lt; 0) d = -d
-      print (d &lt; tol ? "same" : "change")
-    }' "$st")
-
-  case $verdict in
-    change) ;;
-    same)   rm -f "$raw"; keep_as_is "$src" "$out" "$part" "$res"; return ;;
-    silent) rm -f "$raw"; print -r -- "err silent file" &gt; "$res"; return ;;
-    *)      rm -f "$raw"; print -r -- "err could not measure the level" &gt; "$res"; return ;;
-  esac
-
-  if ! cp -p "$src" "$part"; then
-    rm -f "$raw"; print -r -- "err could not write the file" &gt; "$res"; return
-  fi
-  if ! /usr/bin/perl "$pl" splice "$part" "$off" "$len" "$raw"; then
-    rm -f "$raw" "$part"; print -r -- "err unexpected file structure" &gt; "$res"; return
-  fi
-  rm -f "$raw"
-  if mv -f "$part" "$out"; then
-    print ok &gt; "$res"
-  else
-    rm -f "$part"; print -r -- "err could not write the file" &gt; "$res"
-  fi
-}
-
-# Peak of a FLAC file, compared with the target:
-#   "same" | "silent" | "change &lt;gain dB&gt;" | "err"
-flac_verdict() {
-  local v af
-  for af in astats=measure_perchannel=none:measure_overall=Peak_level astats; do
-    v=$("$FFMPEG" -nostdin -hide_banner -nostats -i "$1" -map 0:a:0 -af "$af" -f null - 2&gt;&amp;1 \
-      | awk -v t="$level" -v tol="$tolerance" '
-          /Peak level dB/ { p = $NF; seen = 1 }
-          END {
-            if (!seen) { print "err"; exit }
-            if (p ~ /inf/) { print "silent"; exit }
-            d = t - p; a = d &lt; 0 ? -d : d
-            if (a &lt; tol) print "same"; else printf "change %.6f\n", d
-          }')
-    [[ $v != err ]] &amp;&amp; break
-  done
-  print -r -- "$v"
-}
-
-# FLAC: decode, apply gain, re-encode to FLAC with the same bit depth and sample
-# rate; the result is checked before it is kept.
-flac_job() {   # n src out partial bits rate
-  local n=$1 src=$2 out=$3 part=$4 bits=$5 rate=$6
-  local enc="$tmpdir/$n.flac" res="$tmpdir/$n.res" verdict conv
-  local -a fmt
-
-  [[ -n $FFMPEG ]] || { print -r -- "err ffmpeg not found (required for FLAC)" &gt; "$res"; return; }
-  case $bits in
-    16) fmt=(-sample_fmt s16); conv="aresample=osf=s16:dither_method=triangular" ;;
-    24) fmt=(-sample_fmt s32 -bits_per_raw_sample 24); conv="aresample=osf=s32" ;;
-    32) fmt=(-sample_fmt s32 -bits_per_raw_sample 32 -strict experimental); conv="aresample=osf=s32" ;;
-    *)  print -r -- "err unsupported FLAC bit depth (${bits}-bit)" &gt; "$res"; return ;;
-  esac
-
-  verdict=$(flac_verdict "$src")
-  case $verdict in
-    change\ *) ;;
-    same)   keep_as_is "$src" "$out" "$part" "$res"; return ;;
-    silent) print -r -- "err silent file" &gt; "$res"; return ;;
-    *)      print -r -- "err could not measure the level" &gt; "$res"; return ;;
-  esac
-
-  if ! "$FFMPEG" -nostdin -v error -y -i "$src" -map 0:a:0 -map '0:v?' -map_metadata 0 \
-       -c copy -c:a flac "${fmt[@]}" -ar "$rate" \
-       -af "volume=${verdict#change }dB:precision=double,${conv}" "$enc"; then
-    rm -f "$enc"; print -r -- "err ffmpeg failed" &gt; "$res"; return
-  fi
-  if [[ $(/usr/bin/perl "$pl" flacinfo "$enc") != "$bits $rate" ]]; then
-    rm -f "$enc"; print -r -- "err bit depth or sample rate changed, file not written" &gt; "$res"; return
-  fi
-  # cp -p, then overwrite the content: Finder tags / extended attributes are kept
-  if cp -p "$src" "$part" &amp;&amp; cat "$enc" &gt; "$part" &amp;&amp; mv -f "$part" "$out"; then
-    print ok &gt; "$res"
-  else
-    rm -f "$part"; print -r -- "err could not write the file" &gt; "$res"
-  fi
-  rm -f "$enc"
-}
-
-# --- 1. Scan the selection (headers only) ----------------------------------------
-files=() infos=()
-skipped=""
-scan=("${(@f)$(/usr/bin/perl "$pl" scan "$@")}")
-for (( i = 1; i &lt;= $#; i++ )); do
-  f=${argv[i]}
-  case ${scan[i]} in
-    pcm\ *|flac\ *) files+=("$f"); infos+=("${scan[i]}") ;;
-    lossy)          skipped+="${f##*/}"$'\n' ;;
-    compressed)     skipped+="${f##*/} (compressed audio)"$'\n' ;;
-    unreadable)     skipped+="${f##*/} (unreadable file)"$'\n' ;;
-  esac
-done
-
-if (( ${#files} == 0 )); then
-  alert "No lossless audio file selected" \
-    "Supported formats: WAV, AIFF, CAF, FLAC."$'\n\n'"Skipped:"$'\n'"${skipped}"
+if [[ -z $FFMPEG ]]; then
+  /usr/bin/osascript -e 'display alert "ffmpeg not found" message "Analyze Loudness needs ffmpeg. Install it with Homebrew: brew install ffmpeg" as critical' >/dev/null 2>&1
   exit 0
 fi
 
-# --- 2. Target level, then Overwrite / Duplicate ----------------------------------
-if (( ${#files} == 1 )); then
-  what="“${files[1]##*/}”"
-  over_text="Overwrite: replace the original file. This cannot be undone."
-  dup_text="Duplicate: create a normalized copy in a “${copydir}” subfolder, next to the original."
-else
-  what="$(plural ${#files} file)"
-  over_text="Overwrite: replace the original files. This cannot be undone."
-  dup_text="Duplicate: create normalized copies in a “${copydir}” subfolder, next to the originals."
-fi
-head_text="Normalize ${what} to %LEVEL%."
-prompt_text="Normalize ${what}"$'\n'"Target peak level:"
-level_items=()
-for l in "${levels[@]}"; do level_items+=("$l dB"); done
+# --- 1. Measure every file (several at a time) -------------------------------------
+# Each job writes "I TP LRA" (or "err") to $tmpdir/<n>.res
+measure() {   # n file
+  "$FFMPEG" -nostdin -hide_banner -nostats -i "$2" -map 0:a:0 \
+      -af ebur128=peak=true:framelog=quiet -f null - 2>&1 \
+    | awk '/Summary:/ { s = 1 }
+           s && $1 == "I:"    { i = $2 }
+           s && $1 == "LRA:"  { l = $2 }
+           s && $1 == "Peak:" { p = $2 }
+           END { if (i == "") print "err"; else print i, p, l }' > "$tmpdir/$1.res"
+}
 
-# Logo shown in the alert (PNG, base64)
-/usr/bin/base64 --decode &gt; "$tmpdir/icon.png" 2&gt;/dev/null &lt;&lt;'ICON'
+files=()
+for f in "$@"; do [[ -f $f ]] && files+=("$f"); done
+(( ${#files} )) || exit 0
+
+maxjobs=$(/usr/sbin/sysctl -n hw.ncpu 2>/dev/null)
+[[ $maxjobs == <-> ]] || maxjobs=4
+(( maxjobs > 6 )) && maxjobs=6
+pids=()
+for (( n = 1; n <= ${#files}; n++ )); do
+  measure $n "${files[n]}" &
+  pids+=($!)
+  if (( ${#pids} >= maxjobs )); then wait ${pids[1]}; shift pids; fi
+done
+wait
+
+# --- 2. Results ---------------------------------------------------------------------
+# Gain each platform applies to a track (track mode). "up" platforms turn quiet
+# tracks up only while the true peak stays at or below -1 dBTP; "down" platforms
+# never turn up; "limiter" reaches the target in any case (Spotify Loud);
+# "exact" is a delivery target (broadcast).
+platforms=(
+  "Spotify Normal:-14:up"
+  "Spotify Loud:-11:limiter"
+  "Spotify Quiet:-19:up"
+  "YouTube:-14:down"
+  "Apple Music:-16:down"
+  "Tidal:-14:up"
+  "Amazon Music:-14:up"
+  "Deezer:-15:up"
+  "SoundCloud:-14:down"
+  "Broadcast EBU R128:-23:exact"
+)
+
+specs=()     # one entry per file, lines: name / loudness / true peak / menu items
+plain=""     # same results as plain text, for "Copy Results"
+for (( n = 1; n <= ${#files}; n++ )); do
+  name=${files[n]##*/}
+  r=""
+  [[ -f $tmpdir/$n.res ]] && r=$(<"$tmpdir/$n.res")
+  if [[ -z $r || $r == err ]]; then
+    specs+=("${name}"$'\n'"!Not an audio file, or unreadable")
+    plain+="${name}"$'\n'"Not an audio file, or unreadable"$'\n\n'
+    continue
+  fi
+  out=$(print -r -- "$r" | awk -v plats="${(j:|:)platforms}" '
+    function fmt(g) { if (g > -0.05 && g < 0.05) return "0.0 dB"; return sprintf("%+.1f dB", g) }
+    { i = $1; tp = $2 }
+    END {
+      if (i <= -70) { print "silent"; exit }
+      printf "%.1f LUFS\n%+.1f dBTP\n", i, tp
+      np = split(plats, P, "|")
+      for (k = 1; k <= np; k++) {
+        split(P[k], f, ":"); label = f[1]; t = f[2] + 0; mode = f[3]
+        g = t - i; note = ""
+        if (g > 0) {
+          if (mode == "down") { g = 0; note = " (not turned up)" }
+          else if (mode == "up") {
+            room = -1 - tp; if (room < 0) room = 0
+            if (g > room) { g = room; note = " (limited by true peak)" }
+          }
+          else if (mode == "limiter" && tp + g > -1) note = " (limiter)"
+        }
+        printf "%s %d LUFS: %s%s\n", label, t, fmt(g), note
+      }
+    }')
+  if [[ $out == silent ]]; then
+    specs+=("${name}"$'\n'"!Silent (below -70 LUFS)")
+    plain+="${name}"$'\n'"Silent (below -70 LUFS)"$'\n\n'
+    continue
+  fi
+  specs+=("${name}"$'\n'"${out}")
+  lines=("${(@f)out}")
+  plain+="${name}"$'\n'"Loudness: ${lines[1]}"$'\n'"True peak: ${lines[2]}"$'\n'
+  plain+="${lines[3]}"$'\n'      # default platform (Spotify Normal -14 LUFS)
+  plain+=$'\n'
+done
+while [[ $plain == *$'\n' ]]; do plain=${plain%$'\n'}; done   # no trailing blank lines
+
+# --- 3. Window -------------------------------------------------------------------------
+/usr/bin/base64 --decode > "$tmpdir/icon.png" 2>/dev/null <<'ICON'
 iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAEAAElEQVR42uy9d5hkV3H+/znnps49
 3ZNnNmdtUM5IQggUABEMSASbYIwTJgf764QkLIxtwIDBgAkGbEwQIiogIYRyDrta7WpznJ2dPNO5
 +6Zzfn/c7tnZ1UpaiSDsX9fzzLOzM9093feeU6fqrbfegra1rW1ta1vb2ta2trWtbW1rW9va1ra2
@@ -1670,9 +1339,7 @@ i4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLy3uW/xelrsbi0etWdgAAAABJ
 RU5ErkJggg==
 ICON
 
-# The second window is a native alert, so that the text can use colors and bold:
-# AppleLoopEditor's coral red (logoRed) and vintage yellow (vintageYellow).
-cat &gt; "$tmpdir/dialog.applescript" &lt;&lt;'APPLESCRIPT'
+cat > "$tmpdir/results.applescript" <<'APPLESCRIPT'
 use AppleScript version "2.4"
 use framework "Foundation"
 use framework "AppKit"
@@ -1680,74 +1347,49 @@ use scripting additions
 
 property centerValue : 1
 property centeredStyle : missing value
-property boldFont : missing value
-property plainFont : missing value
 property redColor : missing value
 property yellowColor : missing value
 property logo : missing value
 property lastHeight : 0
+property copyParts : {}
+property batchPopup : missing value
+property batchTabs : missing value
+property batchModel : missing value
 
 on run argv
-	set thePrompt to item 1 of argv
-	set headTemplate to item 2 of argv
-	set overText to item 3 of argv
-	set dupText to item 4 of argv
-	set defaultLevel to item 5 of argv
-	set iconPath to item 6 of argv
-	set levelList to items 7 thru -1 of argv
+	set plainText to item 1 of argv
+	set iconPath to item 2 of argv
+	set fileSpecs to items 3 thru -1 of argv
 	activate
-
-	-- 1. Target level
+	set usedStyled to true
 	try
 		my setupStyle(iconPath)
-		set lvl to my styledLevelDialog(paragraph 1 of thePrompt, paragraph 2 of thePrompt, levelList, defaultLevel)
+		set choice to my showResults(fileSpecs)
 	on error
-		set lvl to my plainLevelDialog(thePrompt, levelList, defaultLevel)
+		set usedStyled to false
+		set choice to my plainResults(plainText)
 	end try
-	if lvl is "" then return ""
-
-	-- 2. Overwrite / Duplicate
-	set headText to my replaceText(headTemplate, "%LEVEL%", lvl)
-	try
-		set choice to my styledActionDialog(headText, overText, dupText)
-	on error
-		set choice to my plainActionDialog(headText, overText, dupText)
-	end try
-	if choice is "" then return ""
-	return lvl &amp; linefeed &amp; choice
+	if choice is "Copy" then
+		if usedStyled then
+			set the clipboard to my buildCopy()
+		else
+			set the clipboard to plainText
+		end if
+	end if
 end run
 
-on replaceText(theText, findText, newText)
-	set AppleScript's text item delimiters to findText
-	set chunks to text items of theText
-	set AppleScript's text item delimiters to newText
-	set theText to chunks as text
-	set AppleScript's text item delimiters to ""
-	return theText
-end replaceText
 
--- Fallbacks: the standard dialogs, without colors
-on plainLevelDialog(thePrompt, levelList, defaultLevel)
-	set picked to choose from list levelList with title "Peak Normalize" with prompt thePrompt default items {defaultLevel} OK button name "Next" cancel button name "Cancel"
-	if picked is false then return ""
-	return item 1 of picked
-end plainLevelDialog
-
-on plainActionDialog(headText, overText, dupText)
+-- Fallback: the standard dialog, without colors
+on plainResults(plainText)
 	try
-		set d to display dialog (headText &amp; linefeed &amp; linefeed &amp; overText &amp; linefeed &amp; linefeed &amp; dupText) with title "Peak Normalize" buttons {"Overwrite", "Duplicate", "Cancel"} default button "Overwrite" cancel button "Cancel"
-		return button returned of d
-	on error
-		return ""
+		set d to display dialog plainText with title "Analyze Loudness" buttons {"Copy to Clipboard", "OK"} default button "OK"
+		if button returned of d is "Copy to Clipboard" then return "Copy"
 	end try
-end plainActionDialog
+	return ""
+end plainResults
 
--- Fonts, AppleLoopEditor colors (logoRed, vintageYellow), centered text, logo
 on setupStyle(iconPath)
 	set ca to current application
-	set fontSize to ca's NSFont's systemFontSize()
-	set my boldFont to ca's NSFont's boldSystemFontOfSize:fontSize
-	set my plainFont to ca's NSFont's systemFontOfSize:fontSize
 	set my redColor to ca's NSColor's colorWithSRGBRed:0.94 green:0.58 blue:0.47 alpha:1.0
 	set my yellowColor to ca's NSColor's colorWithSRGBRed:0.78 green:0.72 blue:0.48 alpha:0.85
 	-- NSTextAlignmentCenter is 1 on Apple Silicon and 2 on Intel Macs
@@ -1764,20 +1406,26 @@ on setupStyle(iconPath)
 	set my logo to img
 end setupStyle
 
+on pickFont(isBold, theSize)
+	set ca to current application
+	if isBold then return ca's NSFont's boldSystemFontOfSize:theSize
+	return ca's NSFont's systemFontOfSize:theSize
+end pickFont
+
 on addRun(body, theText, theFont, theColor)
 	set ca to current application
 	set attrs to ca's NSDictionary's dictionaryWithObjects:{theFont, theColor, my centeredStyle} forKeys:{ca's NSFontAttributeName, ca's NSForegroundColorAttributeName, ca's NSParagraphStyleAttributeName}
 	body's appendAttributedString:(ca's NSAttributedString's alloc()'s initWithString:theText attributes:attrs)
 end addRun
 
--- "Label: explanation" -&gt; "Label:" in bold, the rest in regular weight
-on addLabelled(body, theText, theColor)
-	set AppleScript's text item delimiters to ":"
-	set theLabel to text item 1 of theText
-	set AppleScript's text item delimiters to ""
-	my addRun(body, theLabel &amp; ":", my boldFont, theColor)
-	my addRun(body, text ((length of theLabel) + 2) thru -1 of theText, my plainFont, theColor)
-end addLabelled
+-- One centered line: "Label: value" (label in bold) or plain text
+on lineLabel(labelText, valueText, theSize, theColor, textWidth)
+	set ca to current application
+	set body to ca's NSMutableAttributedString's alloc()'s init()
+	if labelText is not "" then my addRun(body, labelText & ": ", my pickFont(true, theSize), theColor)
+	my addRun(body, valueText, my pickFont(labelText is "", theSize), theColor)
+	return my makeLabel(body, textWidth)
+end lineLabel
 
 -- Wrapping, centered label of the given width
 on makeLabel(body, textWidth)
@@ -1799,344 +1447,245 @@ on makeLabel(body, textWidth)
 	return field
 end makeLabel
 
-on newAlert(accessory)
+-- Puts a rounded frame around a one-line label (the Loudness result)
+on framedLabel(field, fieldHeight, textWidth)
 	set ca to current application
+	set padX to 18
+	set padY to 6
+	set textW to textWidth * 0.6
+	try
+		set probe to ca's NSTextField's labelWithAttributedString:(field's attributedStringValue())
+		set fit to probe's fittingSize()
+		try
+			set textW to width of fit
+		on error
+			set textW to item 1 of fit
+		end try
+	end try
+	set boxW to textW + 2 * padX
+	if boxW > textWidth then set boxW to textWidth
+	set wrapH to fieldHeight + 2 * padY
+	set wrapper to ca's NSView's alloc()'s initWithFrame:{{0, 0}, {textWidth, wrapH}}
+	set box to ca's NSBox's alloc()'s initWithFrame:{{(textWidth - boxW) / 2, 0}, {boxW, wrapH}}
+	box's setBoxType:4 -- custom
+	box's setTitlePosition:0 -- no title
+	box's setBorderWidth:1.5
+	box's setCornerRadius:8
+	box's setBorderColor:((ca's NSColor's labelColor())'s colorWithAlphaComponent:0.55)
+	box's setFillColor:((ca's NSColor's labelColor())'s colorWithAlphaComponent:0.06)
+	wrapper's addSubview:box
+	field's setFrameOrigin:{0, padY}
+	wrapper's addSubview:field
+	set my lastHeight to wrapH
+	return wrapper
+end framedLabel
+
+-- Clipboard text: name, loudness, true peak and the selected platform
+on buildCopy()
+	set out to ""
+	repeat with e in my copyParts
+		set e to contents of e
+		set out to out & (item 1 of e)
+		set thePopup to item 2 of e
+		set theItems to item 3 of e
+		if thePopup is not missing value then
+			set out to out & linefeed & ((thePopup's titleOfSelectedItem()) as text)
+		else if theItems is not missing value and my batchPopup is not missing value then
+			set idx to ((my batchPopup's indexOfSelectedItem()) as integer) + 1
+			set out to out & linefeed & (item idx of theItems)
+		end if
+		set out to out & linefeed & linefeed
+	end repeat
+	-- no trailing blank lines
+	repeat while out ends with linefeed
+		set out to text 1 thru -2 of out
+	end repeat
+	return out
+end buildCopy
+
+-- Stacks views top to bottom, each one centered horizontally (AppKit's y axis goes up)
+on stackViews(theViews, theHeights, theWidths, gap, outerWidth)
+	set ca to current application
+	set total to 0
+	repeat with h in theHeights
+		set total to total + h
+	end repeat
+	set total to total + gap * ((count of theHeights) - 1)
+	set container to ca's NSView's alloc()'s initWithFrame:{{0, 0}, {outerWidth, total}}
+	set y to total
+	repeat with k from 1 to count of theViews
+		set y to y - (item k of theHeights)
+		((item k of theViews)'s setFrameOrigin:{(outerWidth - (item k of theWidths)) / 2, y})
+		container's addSubview:(item k of theViews)
+		set y to y - gap
+	end repeat
+	set my lastHeight to total
+	return container
+end stackViews
+
+-- Wraps a view in a scroll view when it is taller than maxHeight (starts at the top)
+-- Returns {view, visible height, width}
+on scrollIfNeeded(content, contentHeight, maxHeight, textWidth)
+	set ca to current application
+	if contentHeight <= maxHeight then return {content, contentHeight, textWidth}
+	set scroller to ca's NSScrollView's alloc()'s initWithFrame:{{0, 0}, {textWidth + 20, maxHeight}}
+	scroller's setHasVerticalScroller:true
+	scroller's setDrawsBackground:false
+	scroller's setBorderType:0
+	scroller's setDocumentView:content
+	(scroller's contentView())'s scrollToPoint:{0, contentHeight - maxHeight}
+	scroller's reflectScrolledClipView:(scroller's contentView())
+	return {scroller, maxHeight, textWidth + 20}
+end scrollIfNeeded
+
+-- One file: name / Loudness (framed) / True peak / then either
+--   platformIndex 0: a menu whose items carry the result (single file)
+--   platformIndex n: the result line for platform n (batch, one tab per platform)
+on fileBlock(spec, textWidth, platformIndex, registerCopy)
+	set ca to current application
+	set lns to paragraphs of spec
+	set parts to {}
+	set heights to {}
+	set widths to {}
+	set end of parts to my lineLabel("", item 1 of lns, 15, my yellowColor, textWidth)
+	set end of heights to my lastHeight
+	set end of widths to textWidth
+	if (item 2 of lns) starts with "!" then
+		set end of parts to my lineLabel("", text 2 thru -1 of (item 2 of lns), 14, my yellowColor, textWidth)
+		set end of heights to my lastHeight
+		set end of widths to textWidth
+		if registerCopy then set end of my copyParts to {(item 1 of lns) & linefeed & (text 2 thru -1 of (item 2 of lns)), missing value, missing value}
+	else
+		set end of parts to my framedLabel(my lineLabel("Loudness", item 2 of lns, 18, ca's NSColor's labelColor(), textWidth), my lastHeight, textWidth)
+		set end of heights to my lastHeight
+		set end of widths to textWidth
+		set end of parts to my lineLabel("True peak", item 3 of lns, 14, my yellowColor, textWidth)
+		set end of heights to my lastHeight
+		set end of widths to textWidth
+		set head to (item 1 of lns) & linefeed & "Loudness: " & (item 2 of lns) & linefeed & "True peak: " & (item 3 of lns)
+		if platformIndex is 0 then
+			set menuWidth to 330
+			set popup to ca's NSPopUpButton's alloc()'s initWithFrame:{{0, 0}, {menuWidth, 28}} pullsDown:false
+			popup's addItemsWithTitles:(items 4 thru -1 of lns)
+			popup's selectItemAtIndex:0
+			set end of parts to popup
+			set end of heights to 28
+			set end of widths to menuWidth
+			if registerCopy then set end of my copyParts to {head, popup, missing value}
+		else
+			set r to item (3 + platformIndex) of lns
+			set cutPos to offset of ": " in r
+			set end of parts to my lineLabel(text 1 thru (cutPos - 1) of r, text (cutPos + 2) thru -1 of r, 14, my yellowColor, textWidth)
+			set end of heights to my lastHeight
+			set end of widths to textWidth
+			if registerCopy then set end of my copyParts to {head, missing value, items 4 thru -1 of lns}
+		end if
+	end if
+	return my stackViews(parts, heights, widths, 6, textWidth)
+end fileBlock
+
+-- Backup for the binding below: switch tabs from the menu's action
+on platformChanged:sender
+	try
+		(my batchTabs)'s selectTabViewItemAtIndex:(sender's indexOfSelectedItem())
+	end try
+end platformChanged:
+
+on showResults(fileSpecs)
+	set ca to current application
+	if my centeredStyle is missing value then error "style not ready"
+	set textWidth to 440
+	set maxHeight to 420
+	set my copyParts to {}
+
+	-- Platform names, from the first file that could be measured
+	set platformTitles to {}
+	repeat with spec in fileSpecs
+		set lns to paragraphs of (spec as text)
+		if (count of lns) > 3 then
+			repeat with entry in (items 4 thru -1 of lns)
+				set s to entry as text
+				set end of platformTitles to text 1 thru ((offset of ": " in s) - 1) of s
+			end repeat
+			exit repeat
+		end if
+	end repeat
+	-- Same layout for one or several files: results under each file, one menu at the bottom
+	set isBatch to (count of platformTitles) > 0
+
+	-- Title, drawn here in red (NSAlert's own title cannot be colored)
+	set titleLabel to my lineLabel("", "Analyze Loudness", 15, my redColor, textWidth)
+	set titleHeight to my lastHeight
+
+	if not isBatch then
+		set blocks to {}
+		set heights to {}
+		set widths to {}
+		repeat with spec in fileSpecs
+			set end of blocks to my fileBlock(spec as text, textWidth, 0, true)
+			set end of heights to my lastHeight
+			set end of widths to textWidth
+		end repeat
+		set listView to my stackViews(blocks, heights, widths, 26, textWidth)
+		set shown to my scrollIfNeeded(listView, my lastHeight, maxHeight, textWidth)
+		set outerWidth to item 3 of shown
+		set accessory to my stackViews({titleLabel, item 1 of shown}, {titleHeight, item 2 of shown}, {textWidth, outerWidth}, 20, outerWidth)
+	else
+		-- One tab per platform, each with the results of every file; a single menu
+		-- at the bottom selects the tab.
+		set tabs to ca's NSTabView's alloc()'s initWithFrame:{{0, 0}, {textWidth, 100}}
+		tabs's setTabViewType:6 -- no tabs, no border
+		repeat with p from 1 to count of platformTitles
+			set blocks to {}
+			set heights to {}
+			set widths to {}
+			repeat with spec in fileSpecs
+				set end of blocks to my fileBlock(spec as text, textWidth, p, p is 1)
+				set end of heights to my lastHeight
+				set end of widths to textWidth
+			end repeat
+			set listView to my stackViews(blocks, heights, widths, 26, textWidth)
+			set shown to my scrollIfNeeded(listView, my lastHeight, maxHeight, textWidth)
+			set tabItem to ca's NSTabViewItem's alloc()'s initWithIdentifier:(p as text)
+			tabItem's setView:(item 1 of shown)
+			tabs's addTabViewItem:tabItem
+		end repeat
+		set tabHeight to item 2 of shown
+		set outerWidth to item 3 of shown
+		tabs's setFrameSize:{outerWidth, tabHeight}
+
+		set menuWidth to 240
+		set popup to ca's NSPopUpButton's alloc()'s initWithFrame:{{0, 0}, {menuWidth, 28}} pullsDown:false
+		popup's addItemsWithTitles:platformTitles
+		popup's selectItemAtIndex:0
+		set my batchPopup to popup
+		set my batchTabs to tabs
+		set my batchModel to ca's NSMutableDictionary's dictionaryWithDictionary:{sel:0}
+		popup's bind:"selectedIndex" toObject:(my batchModel) withKeyPath:"sel" options:(missing value)
+		tabs's bind:"selectedIndex" toObject:(my batchModel) withKeyPath:"sel" options:(missing value)
+		try
+			popup's setTarget:me
+			popup's setAction:"platformChanged:"
+		end try
+		set accessory to my stackViews({titleLabel, tabs, popup}, {titleHeight, tabHeight, 28}, {textWidth, outerWidth, menuWidth}, 20, outerWidth)
+	end if
+
 	set theAlert to ca's NSAlert's alloc()'s init()
-	theAlert's setMessageText:"Peak Normalize"
+	theAlert's setMessageText:""
 	theAlert's setInformativeText:""
 	theAlert's setIcon:(my logo)
 	theAlert's setAccessoryView:accessory
-	return theAlert
-end newAlert
-
-on styledLevelDialog(headText, questionText, levelList, defaultLevel)
-	set ca to current application
-	set textWidth to 420
-	set body to ca's NSMutableAttributedString's alloc()'s init()
-	my addRun(body, headText &amp; linefeed &amp; linefeed, my boldFont, my redColor)
-	my addRun(body, questionText, my boldFont, my yellowColor)
-	set field to my makeLabel(body, textWidth)
-	set labelHeight to my lastHeight
-
-	set popupWidth to 160
-	set popup to ca's NSPopUpButton's alloc()'s initWithFrame:{{(textWidth - popupWidth) / 2, 0}, {popupWidth, 28}} pullsDown:false
-	popup's addItemsWithTitles:levelList
-	popup's selectItemWithTitle:defaultLevel
-
-	set container to ca's NSView's alloc()'s initWithFrame:{{0, 0}, {textWidth, labelHeight + 40}}
-	field's setFrameOrigin:{0, 40}
-	container's addSubview:field
-	container's addSubview:popup
-
-	set theAlert to my newAlert(container)
-	set nextButton to theAlert's addButtonWithTitle:"Next"
-	set cancelButton to theAlert's addButtonWithTitle:"Cancel"
-	nextButton's setKeyEquivalent:(character id 13)
-	cancelButton's setKeyEquivalent:(character id 27)
+	set okButton to theAlert's addButtonWithTitle:"OK"
+	set copyButton to theAlert's addButtonWithTitle:"Copy to Clipboard"
+	okButton's setKeyEquivalent:(character id 13)
+	copyButton's setKeyEquivalent:""
 	ca's NSApplication's sharedApplication()'s activateIgnoringOtherApps:true
 	set response to (theAlert's runModal()) as integer
-	if response is not 1000 then return ""
-	return (popup's titleOfSelectedItem()) as text
-end styledLevelDialog
-
-on styledActionDialog(headText, overText, dupText)
-	set ca to current application
-	if my centeredStyle is missing value then error "style not ready"
-	set body to ca's NSMutableAttributedString's alloc()'s init()
-	my addRun(body, headText &amp; linefeed &amp; linefeed, my boldFont, my redColor)
-	my addLabelled(body, overText, my yellowColor)
-	my addRun(body, linefeed &amp; linefeed, my plainFont, my yellowColor)
-	my addLabelled(body, dupText, my yellowColor)
-	set field to my makeLabel(body, 420)
-
-	set theAlert to my newAlert(field)
-	-- Buttons, top to bottom: Overwrite (default, Return), Duplicate, Cancel (Esc)
-	set overButton to theAlert's addButtonWithTitle:"Overwrite"
-	set dupButton to theAlert's addButtonWithTitle:"Duplicate"
-	set cancelButton to theAlert's addButtonWithTitle:"Cancel"
-	overButton's setKeyEquivalent:(character id 13)
-	dupButton's setKeyEquivalent:""
-	cancelButton's setKeyEquivalent:(character id 27)
-	ca's NSApplication's sharedApplication()'s activateIgnoringOtherApps:true
-	set response to (theAlert's runModal()) as integer
-	if response = 1000 then return "Overwrite"
-	if response = 1001 then return "Duplicate"
+	if response = 1001 then return "Copy"
 	return ""
-end styledActionDialog
+end showResults
 APPLESCRIPT
 
-answer=$(/usr/bin/osascript "$tmpdir/dialog.applescript" "$prompt_text" "$head_text" \
-  "$over_text" "$dup_text" "${default_level} dB" "$tmpdir/icon.png" "${level_items[@]}" 2&gt;/dev/null)
-if (( $? != 0 )); then
-  # Safety net: if the script above cannot run, use the standard dialogs.
-  answer=$(/usr/bin/osascript \
-    -e 'on run argv' \
-    -e 'activate' \
-    -e 'set picked to choose from list (items 4 thru -1 of argv) with title "Peak Normalize" with prompt (item 1 of argv) default items {item 3 of argv} OK button name "Next" cancel button name "Cancel"' \
-    -e 'if picked is false then return ""' \
-    -e 'set lvl to item 1 of picked' \
-    -e 'set AppleScript'"'"'s text item delimiters to "%LEVEL%"' \
-    -e 'set chunks to text items of (item 2 of argv)' \
-    -e 'set AppleScript'"'"'s text item delimiters to lvl' \
-    -e 'set msg to chunks as text' \
-    -e 'set AppleScript'"'"'s text item delimiters to ""' \
-    -e 'try' \
-    -e 'set d to display dialog msg with title "Peak Normalize" buttons {"Overwrite", "Duplicate", "Cancel"} default button "Overwrite" cancel button "Cancel"' \
-    -e 'on error' \
-    -e 'return ""' \
-    -e 'end try' \
-    -e 'return lvl &amp; linefeed &amp; (button returned of d)' \
-    -e 'end run' \
-    "$prompt_text" "${head_text}"$'\n\n'"${over_text}"$'\n\n'"${dup_text}" "${default_level} dB" "${level_items[@]}" \
-    2&gt;/dev/null)
-fi
+/usr/bin/osascript "$tmpdir/results.applescript" "$plain" "$tmpdir/icon.png" "${specs[@]}" >/dev/null 2>&1
 
-[[ $answer == *$'\n'* ]] || exit 0
-level=${${answer%%$'\n'*}% dB}
-case ${answer#*$'\n'} in
-  Overwrite) mode=overwrite ;;
-  Duplicate) mode=duplicate ;;
-  *)         exit 0 ;;
-esac
-
-# --- 3. Normalize, several files at a time ---------------------------------------
-maxjobs=$(/usr/sbin/sysctl -n hw.ncpu 2&gt;/dev/null)
-[[ $maxjobs == &lt;-&gt; ]] || maxjobs=4
-(( maxjobs &gt; 6 )) &amp;&amp; maxjobs=6
-(( maxjobs &lt; 1 )) &amp;&amp; maxjobs=1
-
-pids=()
-for (( n = 1; n &lt;= ${#files}; n++ )); do
-  f=${files[n]}
-  name=${f##*/}
-  dir=${f%/*}; [[ -n $dir ]] || dir=/
-  if [[ $mode == duplicate ]]; then
-    if ! [[ -d $dir/$copydir ]] &amp;&amp; ! mkdir -p "$dir/$copydir"; then
-      print -r -- "err could not create the “${copydir}” folder" &gt; "$tmpdir/$n.res"
-      continue
-    fi
-    out="$dir/$copydir/$name"
-  else
-    out=$f
-  fi
-  # Hidden temporary file next to the destination: the destination is only
-  # replaced once the normalized file is complete.
-  part="${out%/*}/.${name}.normalize-part"
-
-  info=(${=infos[n]})
-  if [[ ${info[1]} == pcm ]]; then
-    pcm_job $n "$f" "$out" "$part" "${(@)info[2,8]}" &amp;
-  else
-    flac_job $n "$f" "$out" "$part" "${info[2]}" "${info[3]}" &amp;
-  fi
-  pids+=($!)
-  if (( ${#pids} &gt;= maxjobs )); then
-    wait ${pids[1]}
-    shift pids
-  fi
-done
-wait
-
-# --- 4. Summary ------------------------------------------------------------------
-count=0 unchanged=0
-errors=""
-for (( n = 1; n &lt;= ${#files}; n++ )); do
-  r=""
-  [[ -f $tmpdir/$n.res ]] &amp;&amp; r=$(&lt;"$tmpdir/$n.res")
-  case $r in
-    ok)     (( count++ )) ;;
-    same)   (( unchanged++ )) ;;
-    err\ *) errors+="${files[n]##*/}: ${r#err }"$'\n' ;;
-    *)      errors+="${files[n]##*/}: unknown error"$'\n' ;;
-  esac
-done
-
-summary=""
-(( count &gt; 0 )) &amp;&amp; summary="$(plural $count file) normalized to ${level} dB"
-if (( unchanged &gt; 0 )); then
-  [[ -n $summary ]] &amp;&amp; summary+=", "
-  if [[ $mode == duplicate ]]; then
-    summary+="$(plural $unchanged file) already at ${level} dB (copied as is)"
-  else
-    summary+="$(plural $unchanged file) already at ${level} dB (audio unchanged)"
-  fi
-fi
-[[ -n $summary ]] || summary="No file normalized"
-[[ $mode == duplicate ]] &amp;&amp; (( count + unchanged &gt; 0 )) &amp;&amp; summary+=" → “${copydir}” folder"
-
-report=""
-[[ -n $errors ]]  &amp;&amp; report+="Errors:"$'\n'"${errors}"$'\n'
-[[ -n $skipped ]] &amp;&amp; report+="Skipped (not a lossless format):"$'\n'"${skipped}"
-if [[ -n $report ]]; then
-  alert "$summary" "$report"
-else
-  notify "Peak Normalize" "$summary"
-fi
-
-exit 0</string>
-					<key>CheckedForUserDefaultShell</key>
-					<true/>
-					<key>inputMethod</key>
-					<integer>1</integer>
-					<key>shell</key>
-					<string>/bin/zsh</string>
-					<key>source</key>
-					<string></string>
-				</dict>
-				<key>BundleIdentifier</key>
-				<string>com.apple.RunShellScript</string>
-				<key>CFBundleVersion</key>
-				<string>2.0.3</string>
-				<key>CanShowSelectedItemsWhenRun</key>
-				<false/>
-				<key>CanShowWhenRun</key>
-				<true/>
-				<key>Category</key>
-				<array>
-					<string>AMCategoryUtilities</string>
-				</array>
-				<key>Class Name</key>
-				<string>RunShellScriptAction</string>
-				<key>InputUUID</key>
-				<string>95B246CA-6330-4B6D-911E-6816C354AA2B</string>
-				<key>Keywords</key>
-				<array>
-					<string>Shell</string>
-					<string>Script</string>
-					<string>Command</string>
-					<string>Run</string>
-					<string>Unix</string>
-				</array>
-				<key>OutputUUID</key>
-				<string>FCD6E9F5-83F8-481F-9D09-053D36AC51AC</string>
-				<key>UUID</key>
-				<string>EDE0E8FF-9AA5-4813-9CD5-D5B6F50CB24A</string>
-				<key>UnlocalizedApplications</key>
-				<array>
-					<string>Automator</string>
-				</array>
-				<key>arguments</key>
-				<dict>
-					<key>0</key>
-					<dict>
-						<key>default value</key>
-						<integer>0</integer>
-						<key>name</key>
-						<string>inputMethod</string>
-						<key>required</key>
-						<string>0</string>
-						<key>type</key>
-						<string>0</string>
-						<key>uuid</key>
-						<string>0</string>
-					</dict>
-					<key>1</key>
-					<dict>
-						<key>default value</key>
-						<false/>
-						<key>name</key>
-						<string>CheckedForUserDefaultShell</string>
-						<key>required</key>
-						<string>0</string>
-						<key>type</key>
-						<string>0</string>
-						<key>uuid</key>
-						<string>1</string>
-					</dict>
-					<key>2</key>
-					<dict>
-						<key>default value</key>
-						<string></string>
-						<key>name</key>
-						<string>source</string>
-						<key>required</key>
-						<string>0</string>
-						<key>type</key>
-						<string>0</string>
-						<key>uuid</key>
-						<string>2</string>
-					</dict>
-					<key>3</key>
-					<dict>
-						<key>default value</key>
-						<string></string>
-						<key>name</key>
-						<string>COMMAND_STRING</string>
-						<key>required</key>
-						<string>0</string>
-						<key>type</key>
-						<string>0</string>
-						<key>uuid</key>
-						<string>3</string>
-					</dict>
-					<key>4</key>
-					<dict>
-						<key>default value</key>
-						<string>/bin/sh</string>
-						<key>name</key>
-						<string>shell</string>
-						<key>required</key>
-						<string>0</string>
-						<key>type</key>
-						<string>0</string>
-						<key>uuid</key>
-						<string>4</string>
-					</dict>
-				</dict>
-				<key>conversionLabel</key>
-				<integer>0</integer>
-				<key>isViewVisible</key>
-				<integer>1</integer>
-				<key>location</key>
-				<string>309.000000:305.000000</string>
-				<key>nibPath</key>
-				<string>/System/Library/Automator/Run Shell Script.action/Contents/Resources/Base.lproj/main.nib</string>
-			</dict>
-			<key>isViewVisible</key>
-			<integer>1</integer>
-		</dict>
-	</array>
-	<key>connectors</key>
-	<dict/>
-	<key>workflowMetaData</key>
-	<dict>
-		<key>applicationBundleID</key>
-		<string>com.apple.finder</string>
-		<key>applicationBundleIDsByPath</key>
-		<dict>
-			<key>/System/Library/CoreServices/Finder.app</key>
-			<string>com.apple.finder</string>
-		</dict>
-		<key>applicationPath</key>
-		<string>/System/Library/CoreServices/Finder.app</string>
-		<key>applicationPaths</key>
-		<array>
-			<string>/System/Library/CoreServices/Finder.app</string>
-		</array>
-		<key>inputTypeIdentifier</key>
-		<string>com.apple.Automator.fileSystemObject.music</string>
-		<key>outputTypeIdentifier</key>
-		<string>com.apple.Automator.nothing</string>
-		<key>presentationMode</key>
-		<integer>15</integer>
-		<key>processesInput</key>
-		<false/>
-		<key>serviceApplicationBundleID</key>
-		<string>com.apple.finder</string>
-		<key>serviceApplicationPath</key>
-		<string>/System/Library/CoreServices/Finder.app</string>
-		<key>serviceInputTypeIdentifier</key>
-		<string>com.apple.Automator.fileSystemObject.music</string>
-		<key>serviceOutputTypeIdentifier</key>
-		<string>com.apple.Automator.nothing</string>
-		<key>serviceProcessesInput</key>
-		<false/>
-		<key>systemImageName</key>
-		<string>NSActionTemplate</string>
-		<key>useAutomaticInputType</key>
-		<false/>
-		<key>workflowTypeIdentifier</key>
-		<string>com.apple.Automator.servicesMenu</string>
-	</dict>
-</dict>
-</plist>
+exit 0

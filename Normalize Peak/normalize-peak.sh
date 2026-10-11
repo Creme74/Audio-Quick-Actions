@@ -1,8 +1,8 @@
 #!/bin/zsh
-# Peak Normalize — macOS Finder Quick Action that peak-normalizes lossless audio files.
+# Normalize Peak — macOS Finder Quick Action that peak-normalizes lossless audio files.
 #
-# - Asks for the target peak level, then whether to overwrite the original files
-#   or duplicate them into a "Normalized" subfolder of the source folder.
+# - One window: the target peak level, then Overwrite (replace the original files)
+#   or Duplicate (copies in a "Normalized" subfolder of the source folder).
 # - Lossless formats only: WAV, AIFF/AIF/AIFC, CAF (uncompressed PCM) and FLAC.
 #   Lossy files (MP3, AAC/M4A...) are skipped.
 # - File type, bit depth (8/16/24/32-bit, integer or float) and sample rate are kept.
@@ -391,6 +391,8 @@ head_text="Normalize ${what} to %LEVEL%."
 prompt_text="Normalize ${what}"$'\n'"Target peak level:"
 level_items=()
 for l in "${levels[@]}"; do level_items+=("$l dB"); done
+names=()
+for f in "${files[@]}"; do names+=("${f##*/}"); done
 
 # Logo shown in the alert (PNG, base64)
 /usr/bin/base64 --decode > "$tmpdir/icon.png" 2>/dev/null <<'ICON'
@@ -1609,8 +1611,9 @@ i4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLy3uW/xelrsbi0etWdgAAAABJ
 RU5ErkJggg==
 ICON
 
-# The second window is a native alert, so that the text can use colors and bold:
-# AppleLoopEditor's coral red (logoRed) and vintage yellow (vintageYellow).
+# One window, in the style of Analyze Loudness / Normalize Loudness: title in
+# AppleLoopEditor's coral red (logoRed), file names and texts in vintage yellow
+# (vintageYellow), target level menu, then Overwrite / Duplicate / Cancel.
 cat > "$tmpdir/dialog.applescript" <<'APPLESCRIPT'
 use AppleScript version "2.4"
 use framework "Foundation"
@@ -1619,74 +1622,52 @@ use scripting additions
 
 property centerValue : 1
 property centeredStyle : missing value
-property boldFont : missing value
-property plainFont : missing value
 property redColor : missing value
 property yellowColor : missing value
 property logo : missing value
 property lastHeight : 0
 
+-- Arguments: icon, file names (one per line), Overwrite text, Duplicate text,
+-- default level, then the levels offered ("0 dB", "-0.1 dB"...).
+-- Returns "<level>" & linefeed & "Overwrite" | "Duplicate", or "" (Cancel)
 on run argv
-	set thePrompt to item 1 of argv
-	set headTemplate to item 2 of argv
+	set iconPath to item 1 of argv
+	set fileNames to item 2 of argv
 	set overText to item 3 of argv
 	set dupText to item 4 of argv
 	set defaultLevel to item 5 of argv
-	set iconPath to item 6 of argv
-	set levelList to items 7 thru -1 of argv
+	set levelList to items 6 thru -1 of argv
 	activate
-
-	-- 1. Target level
 	try
 		my setupStyle(iconPath)
-		set lvl to my styledLevelDialog(paragraph 1 of thePrompt, paragraph 2 of thePrompt, levelList, defaultLevel)
-	on error
-		set lvl to my plainLevelDialog(thePrompt, levelList, defaultLevel)
+		set answer to my showWindow(fileNames, overText, dupText, defaultLevel, levelList)
+	on error errMsg number errNum
+		if errNum is -128 then return ""
+		set answer to my plainWindow(fileNames, overText, dupText, defaultLevel, levelList)
 	end try
-	if lvl is "" then return ""
-
-	-- 2. Overwrite / Duplicate
-	set headText to my replaceText(headTemplate, "%LEVEL%", lvl)
-	try
-		set choice to my styledActionDialog(headText, overText, dupText)
-	on error
-		set choice to my plainActionDialog(headText, overText, dupText)
-	end try
-	if choice is "" then return ""
-	return lvl & linefeed & choice
+	return answer
 end run
 
-on replaceText(theText, findText, newText)
-	set AppleScript's text item delimiters to findText
-	set chunks to text items of theText
-	set AppleScript's text item delimiters to newText
-	set theText to chunks as text
-	set AppleScript's text item delimiters to ""
-	return theText
-end replaceText
-
--- Fallbacks: the standard dialogs, without colors
-on plainLevelDialog(thePrompt, levelList, defaultLevel)
-	set picked to choose from list levelList with title "Peak Normalize" with prompt thePrompt default items {defaultLevel} OK button name "Next" cancel button name "Cancel"
+-- Fallback: the standard dialogs, without colors
+on plainWindow(fileNames, overText, dupText, defaultLevel, levelList)
+	set n to count of paragraphs of fileNames
+	if n = 1 then
+		set what to fileNames
+	else
+		set what to (n as text) & " files"
+	end if
+	set picked to choose from list levelList with title "Normalize Peak" with prompt ("Normalize " & what & linefeed & "Target peak level:") default items {defaultLevel} OK button name "Next" cancel button name "Cancel"
 	if picked is false then return ""
-	return item 1 of picked
-end plainLevelDialog
-
-on plainActionDialog(headText, overText, dupText)
 	try
-		set d to display dialog (headText & linefeed & linefeed & overText & linefeed & linefeed & dupText) with title "Peak Normalize" buttons {"Overwrite", "Duplicate", "Cancel"} default button "Overwrite" cancel button "Cancel"
-		return button returned of d
+		set d to display dialog ("Normalize " & what & " to " & (item 1 of picked) & "." & linefeed & linefeed & overText & linefeed & linefeed & dupText) with title "Normalize Peak" buttons {"Overwrite", "Duplicate", "Cancel"} default button "Overwrite" cancel button "Cancel"
 	on error
 		return ""
 	end try
-end plainActionDialog
+	return (item 1 of picked) & linefeed & (button returned of d)
+end plainWindow
 
--- Fonts, AppleLoopEditor colors (logoRed, vintageYellow), centered text, logo
 on setupStyle(iconPath)
 	set ca to current application
-	set fontSize to ca's NSFont's systemFontSize()
-	set my boldFont to ca's NSFont's boldSystemFontOfSize:fontSize
-	set my plainFont to ca's NSFont's systemFontOfSize:fontSize
 	set my redColor to ca's NSColor's colorWithSRGBRed:0.94 green:0.58 blue:0.47 alpha:1.0
 	set my yellowColor to ca's NSColor's colorWithSRGBRed:0.78 green:0.72 blue:0.48 alpha:0.85
 	-- NSTextAlignmentCenter is 1 on Apple Silicon and 2 on Intel Macs
@@ -1703,20 +1684,35 @@ on setupStyle(iconPath)
 	set my logo to img
 end setupStyle
 
+on pickFont(isBold, theSize)
+	set ca to current application
+	if isBold then return ca's NSFont's boldSystemFontOfSize:theSize
+	return ca's NSFont's systemFontOfSize:theSize
+end pickFont
+
 on addRun(body, theText, theFont, theColor)
 	set ca to current application
 	set attrs to ca's NSDictionary's dictionaryWithObjects:{theFont, theColor, my centeredStyle} forKeys:{ca's NSFontAttributeName, ca's NSForegroundColorAttributeName, ca's NSParagraphStyleAttributeName}
 	body's appendAttributedString:(ca's NSAttributedString's alloc()'s initWithString:theText attributes:attrs)
 end addRun
 
+-- Centered text, bold or regular
+on lineLabel(theText, isBold, theSize, theColor, textWidth)
+	set ca to current application
+	set body to ca's NSMutableAttributedString's alloc()'s init()
+	my addRun(body, theText, my pickFont(isBold, theSize), theColor)
+	return my makeLabel(body, textWidth)
+end lineLabel
+
 -- "Label: explanation" -> "Label:" in bold, the rest in regular weight
-on addLabelled(body, theText, theColor)
-	set AppleScript's text item delimiters to ":"
-	set theLabel to text item 1 of theText
-	set AppleScript's text item delimiters to ""
-	my addRun(body, theLabel & ":", my boldFont, theColor)
-	my addRun(body, text ((length of theLabel) + 2) thru -1 of theText, my plainFont, theColor)
-end addLabelled
+on explanation(theText, theSize, textWidth)
+	set cutPos to offset of ": " in theText
+	set ca to current application
+	set body to ca's NSMutableAttributedString's alloc()'s init()
+	my addRun(body, text 1 thru cutPos of theText, my pickFont(true, theSize), my yellowColor)
+	my addRun(body, text (cutPos + 1) thru -1 of theText, my pickFont(false, theSize), my yellowColor)
+	return my makeLabel(body, textWidth)
+end explanation
 
 -- Wrapping, centered label of the given width
 on makeLabel(body, textWidth)
@@ -1738,57 +1734,102 @@ on makeLabel(body, textWidth)
 	return field
 end makeLabel
 
-on newAlert(accessory)
+-- Single-line label, sized to its text: {field, width}
+on shortLabel(theText, isBold, theSize)
 	set ca to current application
+	set field to ca's NSTextField's labelWithString:theText
+	field's setFont:(my pickFont(isBold, theSize))
+	field's setTextColor:(my yellowColor)
+	set fit to field's fittingSize()
+	try
+		set w to width of fit
+	on error
+		set w to item 1 of fit
+	end try
+	return {field, w}
+end shortLabel
+
+-- Stacks views top to bottom, each one centered horizontally (AppKit's y axis goes up)
+on stackViews(theViews, theHeights, theWidths, gap, outerWidth)
+	set ca to current application
+	set total to 0
+	repeat with h in theHeights
+		set total to total + h
+	end repeat
+	set total to total + gap * ((count of theHeights) - 1)
+	set container to ca's NSView's alloc()'s initWithFrame:{{0, 0}, {outerWidth, total}}
+	set y to total
+	repeat with k from 1 to count of theViews
+		set y to y - (item k of theHeights)
+		((item k of theViews)'s setFrameOrigin:{(outerWidth - (item k of theWidths)) / 2, y})
+		container's addSubview:(item k of theViews)
+		set y to y - gap
+	end repeat
+	set my lastHeight to total
+	return container
+end stackViews
+
+-- File names, one per line; in a scroll view of the same width when too tall
+on namesView(fileNames, textWidth, maxHeight)
+	set ca to current application
+	set field to my lineLabel(fileNames, true, 15, my yellowColor, textWidth)
+	set h to my lastHeight
+	if h <= maxHeight then return {field, h}
+	set field to my lineLabel(fileNames, true, 15, my yellowColor, textWidth - 20)
+	set h to my lastHeight
+	set content to ca's NSView's alloc()'s initWithFrame:{{0, 0}, {textWidth - 20, h}}
+	content's addSubview:field
+	set scroller to ca's NSScrollView's alloc()'s initWithFrame:{{0, 0}, {textWidth, maxHeight}}
+	scroller's setHasVerticalScroller:true
+	scroller's setDrawsBackground:false
+	scroller's setBorderType:0
+	scroller's setDocumentView:content
+	(scroller's contentView())'s scrollToPoint:{0, h - maxHeight}
+	scroller's reflectScrolledClipView:(scroller's contentView())
+	return {scroller, maxHeight}
+end namesView
+
+-- "Target peak level: [ 0 dB ]" (label in white, like the Loudness line of the other two)
+on levelRow(levelList, defaultLevel, textWidth)
+	set ca to current application
+	set leftPart to my shortLabel("Target peak level:", true, 16)
+	(item 1 of leftPart)'s setTextColor:(ca's NSColor's labelColor())
+	set popupWidth to 110
+	set popup to ca's NSPopUpButton's alloc()'s initWithFrame:{{0, 0}, {popupWidth, 28}} pullsDown:false
+	popup's addItemsWithTitles:levelList
+	popup's selectItemWithTitle:defaultLevel
+	set gap to 10
+	set leftW to item 2 of leftPart
+	set x0 to (textWidth - (leftW + gap + popupWidth)) / 2
+	set row to ca's NSView's alloc()'s initWithFrame:{{0, 0}, {textWidth, 28}}
+	(item 1 of leftPart)'s setFrame:{{x0, 3}, {leftW, 21}}
+	popup's setFrameOrigin:{x0 + leftW + gap, 0}
+	row's addSubview:(item 1 of leftPart)
+	row's addSubview:popup
+	return {row, popup}
+end levelRow
+
+on buildAlert(fileNames, overText, dupText, defaultLevel, levelList, maxHeight)
+	set ca to current application
+	set textWidth to 440
+	-- Title, drawn here in red (NSAlert's own title cannot be colored)
+	set titleLabel to my lineLabel("Normalize Peak", true, 15, my redColor, textWidth)
+	set titleHeight to my lastHeight
+	set names to my namesView(fileNames, textWidth, maxHeight)
+	set levelParts to my levelRow(levelList, defaultLevel, textWidth)
+	set overLabel to my explanation(overText, 13, textWidth)
+	set overHeight to my lastHeight
+	set dupLabel to my explanation(dupText, 13, textWidth)
+	set dupHeight to my lastHeight
+	set helpView to my stackViews({overLabel, dupLabel}, {overHeight, dupHeight}, {textWidth, textWidth}, 8, textWidth)
+	set helpHeight to my lastHeight
+	set accessory to my stackViews({titleLabel, item 1 of names, item 1 of levelParts, helpView}, {titleHeight, item 2 of names, 28, helpHeight}, {textWidth, textWidth, textWidth, textWidth}, 20, textWidth)
+
 	set theAlert to ca's NSAlert's alloc()'s init()
-	theAlert's setMessageText:"Peak Normalize"
+	theAlert's setMessageText:""
 	theAlert's setInformativeText:""
 	theAlert's setIcon:(my logo)
 	theAlert's setAccessoryView:accessory
-	return theAlert
-end newAlert
-
-on styledLevelDialog(headText, questionText, levelList, defaultLevel)
-	set ca to current application
-	set textWidth to 420
-	set body to ca's NSMutableAttributedString's alloc()'s init()
-	my addRun(body, headText & linefeed & linefeed, my boldFont, my redColor)
-	my addRun(body, questionText, my boldFont, my yellowColor)
-	set field to my makeLabel(body, textWidth)
-	set labelHeight to my lastHeight
-
-	set popupWidth to 160
-	set popup to ca's NSPopUpButton's alloc()'s initWithFrame:{{(textWidth - popupWidth) / 2, 0}, {popupWidth, 28}} pullsDown:false
-	popup's addItemsWithTitles:levelList
-	popup's selectItemWithTitle:defaultLevel
-
-	set container to ca's NSView's alloc()'s initWithFrame:{{0, 0}, {textWidth, labelHeight + 40}}
-	field's setFrameOrigin:{0, 40}
-	container's addSubview:field
-	container's addSubview:popup
-
-	set theAlert to my newAlert(container)
-	set nextButton to theAlert's addButtonWithTitle:"Next"
-	set cancelButton to theAlert's addButtonWithTitle:"Cancel"
-	nextButton's setKeyEquivalent:(character id 13)
-	cancelButton's setKeyEquivalent:(character id 27)
-	ca's NSApplication's sharedApplication()'s activateIgnoringOtherApps:true
-	set response to (theAlert's runModal()) as integer
-	if response is not 1000 then return ""
-	return (popup's titleOfSelectedItem()) as text
-end styledLevelDialog
-
-on styledActionDialog(headText, overText, dupText)
-	set ca to current application
-	if my centeredStyle is missing value then error "style not ready"
-	set body to ca's NSMutableAttributedString's alloc()'s init()
-	my addRun(body, headText & linefeed & linefeed, my boldFont, my redColor)
-	my addLabelled(body, overText, my yellowColor)
-	my addRun(body, linefeed & linefeed, my plainFont, my yellowColor)
-	my addLabelled(body, dupText, my yellowColor)
-	set field to my makeLabel(body, 420)
-
-	set theAlert to my newAlert(field)
 	-- Buttons, top to bottom: Overwrite (default, Return), Duplicate, Cancel (Esc)
 	set overButton to theAlert's addButtonWithTitle:"Overwrite"
 	set dupButton to theAlert's addButtonWithTitle:"Duplicate"
@@ -1796,22 +1837,54 @@ on styledActionDialog(headText, overText, dupText)
 	overButton's setKeyEquivalent:(character id 13)
 	dupButton's setKeyEquivalent:""
 	cancelButton's setKeyEquivalent:(character id 27)
+	return {theAlert, item 2 of levelParts}
+end buildAlert
+
+-- Button frames tell which layout NSAlert chose: stacked buttons (the centered
+-- layout) or side by side (the old layout, used when the window is too tall).
+on buttonY(b)
+	set r to b's frame()
+	try
+		return y of origin of r
+	on error
+		return item 2 of item 1 of r
+	end try
+end buttonY
+
+on isCentered(theAlert)
+	set theButtons to theAlert's buttons()
+	set y1 to my buttonY(theButtons's objectAtIndex:0)
+	set y2 to my buttonY(theButtons's objectAtIndex:1)
+	return (y1 - y2 > 1 or y2 - y1 > 1)
+end isCentered
+
+on showWindow(fileNames, overText, dupText, defaultLevel, levelList)
+	set ca to current application
+	if my centeredStyle is missing value then error "style not ready"
+	-- The file list gets shorter until the window fits with the centered layout
+	repeat with maxHeight in {360, 300, 250, 200, 160, 120}
+		set built to my buildAlert(fileNames, overText, dupText, defaultLevel, levelList, contents of maxHeight)
+		set theAlert to item 1 of built
+		theAlert's layout()
+		if my isCentered(theAlert) then exit repeat
+	end repeat
 	ca's NSApplication's sharedApplication()'s activateIgnoringOtherApps:true
 	set response to (theAlert's runModal()) as integer
-	if response = 1000 then return "Overwrite"
-	if response = 1001 then return "Duplicate"
+	set lvl to ((item 2 of built)'s titleOfSelectedItem()) as text
+	if response = 1000 then return lvl & linefeed & "Overwrite"
+	if response = 1001 then return lvl & linefeed & "Duplicate"
 	return ""
-end styledActionDialog
+end showWindow
 APPLESCRIPT
 
-answer=$(/usr/bin/osascript "$tmpdir/dialog.applescript" "$prompt_text" "$head_text" \
-  "$over_text" "$dup_text" "${default_level} dB" "$tmpdir/icon.png" "${level_items[@]}" 2>/dev/null)
+answer=$(/usr/bin/osascript "$tmpdir/dialog.applescript" "$tmpdir/icon.png" "${(F)names}" \
+  "$over_text" "$dup_text" "${default_level} dB" "${level_items[@]}" 2>/dev/null)
 if (( $? != 0 )); then
   # Safety net: if the script above cannot run, use the standard dialogs.
   answer=$(/usr/bin/osascript \
     -e 'on run argv' \
     -e 'activate' \
-    -e 'set picked to choose from list (items 4 thru -1 of argv) with title "Peak Normalize" with prompt (item 1 of argv) default items {item 3 of argv} OK button name "Next" cancel button name "Cancel"' \
+    -e 'set picked to choose from list (items 4 thru -1 of argv) with title "Normalize Peak" with prompt (item 1 of argv) default items {item 3 of argv} OK button name "Next" cancel button name "Cancel"' \
     -e 'if picked is false then return ""' \
     -e 'set lvl to item 1 of picked' \
     -e 'set AppleScript'"'"'s text item delimiters to "%LEVEL%"' \
@@ -1820,7 +1893,7 @@ if (( $? != 0 )); then
     -e 'set msg to chunks as text' \
     -e 'set AppleScript'"'"'s text item delimiters to ""' \
     -e 'try' \
-    -e 'set d to display dialog msg with title "Peak Normalize" buttons {"Overwrite", "Duplicate", "Cancel"} default button "Overwrite" cancel button "Cancel"' \
+    -e 'set d to display dialog msg with title "Normalize Peak" buttons {"Overwrite", "Duplicate", "Cancel"} default button "Overwrite" cancel button "Cancel"' \
     -e 'on error' \
     -e 'return ""' \
     -e 'end try' \
@@ -1909,7 +1982,7 @@ report=""
 if [[ -n $report ]]; then
   alert "$summary" "$report"
 else
-  notify "Peak Normalize" "$summary"
+  notify "Normalize Peak" "$summary"
 fi
 
 exit 0
