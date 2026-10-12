@@ -1679,6 +1679,14 @@ on showResults(fileSpecs)
 	set copyButton to theAlert's addButtonWithTitle:"Copy to Clipboard"
 	okButton's setKeyEquivalent:(character id 13)
 	copyButton's setKeyEquivalent:""
+	-- osascript runs in the background: as an accessory app it may come to the front
+	try
+		ca's NSApplication's sharedApplication()'s setActivationPolicy:1
+	end try
+	-- Floating level: the window stays above the Finder windows
+	try
+		(theAlert's |window|())'s setLevel:3
+	end try
 	ca's NSApplication's sharedApplication()'s activateIgnoringOtherApps:true
 	set response to (theAlert's runModal()) as integer
 	if response = 1001 then return "Copy"

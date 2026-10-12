@@ -2236,6 +2236,10 @@ on showWindow(fileSpecs, targetTitles, overText, dupText)
 		set centered to my isCentered(theAlert)
 		if centered then exit repeat
 	end repeat
+	-- Floating level: the window stays above the Finder windows
+	try
+		(theAlert's |window|())'s setLevel:3
+	end try
 	ca's NSApplication's sharedApplication()'s activateIgnoringOtherApps:true
 	set response to (theAlert's runModal()) as integer
 	set idx to (((my batchPopup)'s indexOfSelectedItem()) as integer) + 1

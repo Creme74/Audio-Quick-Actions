@@ -11,6 +11,7 @@ A small collection of macOS Finder Quick Actions for music producers and sound d
 | [Normalize Peak](#normalize-peak) | Peak-normalizes lossless audio files without losing their metadata (Apple Loops tags included). |
 | [Normalize Loudness](#normalize-loudness) | Brings lossless audio files to a target loudness (Spotify, Apple Music, YouTube, broadcast or your own value), with a plain, transparent gain change. |
 | [Analyze Loudness](#analyze-loudness) | Measures the loudness (LUFS) and true peak of any audio file, and shows what each streaming platform would do with it. |
+| [Find Mono](#find-mono) | Finds mono audio hidden in stereo files and turns those files into real mono files, bit for bit. |
 
 ---
 
@@ -28,6 +29,7 @@ A small collection of macOS Finder Quick Actions for music producers and sound d
 | Normalize Peak | WAV, AIFF, CAF | FLAC only |
 | Normalize Loudness | WAV, AIFF, CAF | always (measurement and FLAC) |
 | Analyze Loudness | — | always |
+| Find Mono | — | always |
 
 The classic `sox` formula works too.
 
@@ -37,6 +39,7 @@ The classic `sox` formula works too.
    - [Normalize-Peak.zip](https://github.com/Creme74/Audio-Quick-Actions/releases/latest/download/Normalize-Peak.zip)
    - [Normalize-Loudness.zip](https://github.com/Creme74/Audio-Quick-Actions/releases/latest/download/Normalize-Loudness.zip)
    - [Analyze-Loudness.zip](https://github.com/Creme74/Audio-Quick-Actions/releases/latest/download/Analyze-Loudness.zip)
+   - [Find-Mono.zip](https://github.com/Creme74/Audio-Quick-Actions/releases/latest/download/Find-Mono.zip)
 2. Double-click the `.workflow` file and click **Install**.
 3. If it doesn't show up in the Finder's right-click menu, open **System Settings**, search for **Extensions**, go to **Finder** and tick it.
 
@@ -143,6 +146,38 @@ Measures the loudness of your audio files and shows what each streaming platform
 Spotify's targets and rules come from its official documentation. The other platforms' values are the ones commonly reported; they are not always officially published and may change.
 
 [`Analyze Loudness/analyze-loudness.sh`](Analyze%20Loudness/analyze-loudness.sh) is a readable copy of the script embedded in the workflow.
+
+---
+
+## Find Mono
+
+Sample packs and old projects are full of stereo files that are really mono: twice the size, for nothing. Find Mono finds them and can turn them into real mono files, without changing a single sample of the audio.
+
+### What it finds
+
+| Result | Meaning | Converted |
+|---|---|---|
+| **100% Mono** | Mono file disguised as a stereo file: both channels are identical (or differ only by an inaudible dither noise) | Yes |
+| **99.9% Mono** | Practically mono: the difference between the channels is at least 40 dB below the signal | If you tick its box |
+| **Fake Mono** | A mono signal panned to one side, or with one channel in inverted polarity | If you tick its box |
+| **Left / Right channel only** | One channel is silent | If you tick its box |
+| **Real stereo** | A real stereo file | No |
+
+### Features
+
+- **Batch friendly**: select a hundred files; when several files are selected, only the ones with something to do are listed, with the number of stereo and mono files found. If there is nothing to do: *All good, no hidden mono file found!*
+- **Overwrite or Duplicate**: replace the original files, or create mono copies in a `Mono` subfolder next to the originals (same file names)
+- **Nothing is recomputed**: the mono file keeps one channel exactly as it was, bit for bit (the left one, or the louder one for a panned file). Every converted file is compared sample by sample with the original before it is kept
+- **Metadata stays intact**: for WAV, AIFF and CAF files, every chunk is kept byte for byte (Apple Loops information, markers, ID3 tags, sampler data…), except the ones that describe the channels. Finder tags and Spotlight comments are kept too
+- **Same format, same resolution**: bit depth and sample rate never change; FLAC files stay FLAC, with their tags and cover art
+- **Lossless formats only**: WAV, AIFF / AIF / AIFC, CAF (uncompressed) and FLAC. Other files are skipped
+
+### Good to know
+
+- The analysis is done in double precision on the whole file: the level of each channel, of their sum and of their difference.
+- **Overwrite cannot be undone.** Use Duplicate if you want to keep your originals.
+
+[`Find Mono/find-mono.sh`](Find%20Mono/find-mono.sh) is a readable copy of the script embedded in the workflow.
 
 ---
 

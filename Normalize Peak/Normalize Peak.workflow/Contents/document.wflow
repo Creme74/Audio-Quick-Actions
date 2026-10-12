@@ -1929,6 +1929,14 @@ on showWindow(fileNames, overText, dupText, defaultLevel, levelList)
 		theAlert's layout()
 		if my isCentered(theAlert) then exit repeat
 	end repeat
+	-- osascript runs in the background: as an accessory app it may come to the front
+	try
+		ca's NSApplication's sharedApplication()'s setActivationPolicy:1
+	end try
+	-- Floating level: the window stays above the Finder windows
+	try
+		(theAlert's |window|())'s setLevel:3
+	end try
 	ca's NSApplication's sharedApplication()'s activateIgnoringOtherApps:true
 	set response to (theAlert's runModal()) as integer
 	set lvl to ((item 2 of built)'s titleOfSelectedItem()) as text
