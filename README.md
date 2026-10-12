@@ -153,6 +153,10 @@ Spotify's targets and rules come from its official documentation. The other plat
 
 Sample packs and old projects are full of stereo files that are really mono: twice the size, for nothing. Find Mono finds them and can turn them into real mono files, without changing a single sample of the audio.
 
+<p align="center">
+  <img src="Docs/find-mono-screenshot.png" width="720" alt="Find Mono window next to the selected files in the Finder">
+</p>
+
 ### What it finds
 
 | Result | Meaning | Converted |
