@@ -1958,6 +1958,7 @@ property logo : missing value
 property lastHeight : 0
 property optionBoxes : {}
 property windowShown : false
+property allBox : missing value
 
 -- Arguments: icon, summary, Overwrite text, Duplicate text (both empty when there
 -- is nothing to convert), then one result block per file.
@@ -2222,6 +2223,26 @@ on resultsView(fileSpecs, textWidth, maxHeight)
 	return {scroller, maxHeight}
 end resultsView
 
+-- "Tick all" box clicked: every file box takes its state
+on tickAll:sender
+	set newState to (sender's state()) as integer
+	repeat with ob in my optionBoxes
+		set fileBox to item 2 of (contents of ob)
+		fileBox's setState:newState
+	end repeat
+end tickAll:
+
+-- A file box clicked: "Tick all" is ticked only while every file box is
+on boxTicked:sender
+	if my allBox is missing value then return
+	set allOn to 1
+	repeat with ob in my optionBoxes
+		set fileBox to item 2 of (contents of ob)
+		if ((fileBox's state()) as integer) = 0 then set allOn to 0
+	end repeat
+	(my allBox)'s setState:allOn
+end boxTicked:
+
 on buildAlert(fileSpecs, summaryText, overText, dupText, maxHeight)
 	set ca to current application
 	set textWidth to 440
@@ -2238,11 +2259,41 @@ on buildAlert(fileSpecs, summaryText, overText, dupText, maxHeight)
 	end if
 	set summaryLabel to my makeLabel(body, textWidth)
 	set summaryHeight to my lastHeight
+	set my allBox to missing value
 	if (count of fileSpecs) &gt; 0 then
 		set results to my resultsView(fileSpecs, textWidth, maxHeight)
 		set theViews to {titleLabel, item 1 of results, summaryLabel}
 		set theHeights to {titleHeight, item 2 of results, summaryHeight}
 		set theWidths to {textWidth, textWidth, textWidth}
+		-- Several boxes: one more box, under the summary, ticks or unticks them all
+		set boxCount to count of my optionBoxes
+		if boxCount &gt; 1 then
+			set allTitle to "Tick all " &amp; boxCount &amp; " files"
+			set newBox to ca's NSButton's checkboxWithTitle:allTitle target:(missing value) action:(missing value)
+			newBox's setTarget:me
+			newBox's setAction:"tickAll:"
+			set attrs to ca's NSDictionary's dictionaryWithObjects:{my pickFont(true, 14), ca's NSColor's labelColor()} forKeys:{ca's NSFontAttributeName, ca's NSForegroundColorAttributeName}
+			newBox's setAttributedTitle:(ca's NSAttributedString's alloc()'s initWithString:allTitle attributes:attrs)
+			newBox's setState:0
+			newBox's setRefusesFirstResponder:true -- Return stays on the default button
+			set fit to newBox's fittingSize()
+			try
+				set boxWidth to width of fit
+			on error
+				set boxWidth to item 1 of fit
+			end try
+			if boxWidth &gt; textWidth then set boxWidth to textWidth
+			newBox's setFrame:{{0, 0}, {boxWidth, 22}}
+			repeat with ob in my optionBoxes
+				set fileBox to item 2 of (contents of ob)
+				fileBox's setTarget:me
+				fileBox's setAction:"boxTicked:"
+			end repeat
+			set my allBox to newBox
+			set end of theViews to newBox
+			set end of theHeights to 22
+			set end of theWidths to boxWidth
+		end if
 	else
 		-- nothing to list (several files, all of them real stereo or mono)
 		set theViews to {titleLabel, summaryLabel}
