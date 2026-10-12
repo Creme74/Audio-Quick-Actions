@@ -12,6 +12,7 @@ A small collection of macOS Finder Quick Actions for music producers and sound d
 | [Normalize Loudness](#normalize-loudness) | Brings lossless audio files to a target loudness (Spotify, Apple Music, YouTube, broadcast or your own value), with a plain, transparent gain change. |
 | [Analyze Loudness](#analyze-loudness) | Measures the loudness (LUFS) and true peak of any audio file, and shows what each streaming platform would do with it. |
 | [Find Mono](#find-mono) | Finds mono audio hidden in stereo files and turns those files into real mono files, bit for bit. |
+| [Make Cover](#make-cover) | Draws a cover from the waveform of each track and embeds it in the file, without touching the audio. |
 
 ---
 
@@ -30,8 +31,11 @@ A small collection of macOS Finder Quick Actions for music producers and sound d
 | Normalize Loudness | WAV, AIFF, CAF | always (measurement and FLAC) |
 | Analyze Loudness | — | always |
 | Find Mono | — | always |
+| Make Cover | — | always |
 
 The classic `sox` formula works too.
+
+**First run:** the first time a Quick Action works on files in your Downloads, Desktop or Documents folder, or on an external drive, macOS may ask whether *ffmpeg*, *ffprobe* or *sox* can access them. Click **Allow** for each one. If you clicked *Don't Allow*, go to **System Settings › Privacy & Security › Files and Folders**, find the tool and turn the folder or **Removable Volumes** back on. macOS may ask again after a Homebrew update.
 
 ## Download & installation
 
@@ -40,6 +44,7 @@ The classic `sox` formula works too.
    - [Normalize-Loudness.zip](https://github.com/Creme74/Audio-Quick-Actions/releases/latest/download/Normalize-Loudness.zip)
    - [Analyze-Loudness.zip](https://github.com/Creme74/Audio-Quick-Actions/releases/latest/download/Analyze-Loudness.zip)
    - [Find-Mono.zip](https://github.com/Creme74/Audio-Quick-Actions/releases/latest/download/Find-Mono.zip)
+   - [Make-Cover.zip](https://github.com/Creme74/Audio-Quick-Actions/releases/latest/download/Make-Cover.zip)
 2. Double-click the `.workflow` file and click **Install**.
 3. If it doesn't show up in the Finder's right-click menu, open **System Settings**, search for **Extensions**, go to **Finder** and tick it.
 
@@ -182,6 +187,36 @@ Sample packs and old projects are full of stereo files that are really mono: twi
 - **Overwrite cannot be undone.** Use Duplicate if you want to keep your originals.
 
 [`Find Mono/find-mono.sh`](Find%20Mono/find-mono.sh) is a readable copy of the script embedded in the workflow.
+
+---
+
+## Make Cover
+
+Gives every track its own cover, drawn from its own sound: the loudness of the whole track over time, as a waveform or a circle. Handy for demos, promos, edits and bounces that would otherwise show up as a blank square in your music player or DJ software.
+
+<p align="center">
+  <img src="Docs/make-cover-screenshot.png" width="420" alt="Make Cover window">
+</p>
+
+### Features
+
+- **Two styles**: *Waveform* (a mirrored waveform across the cover) or *Circle* (the waveform wrapped around a circle)
+- **Dark or Light background**, and **13 color gradients**: Vintage, Red Ink, Faded Red, Gold, Mono, Neon, Sunset, Ocean, Sky, Forest, Mint, Blush, Yellow
+- **Title and artist**: suggested from the file's tags, or from its name (`Artist - Title`), and editable. Untick **Show text** for a cover without text
+- **Live preview**: the cover is redrawn as you change the style, the colors or the text
+- **Several files at once**: each file gets its own cover; use ◀ ▶ to go through them and adjust each title and artist
+- **Add Cover**: the cover is embedded in the file and replaces the existing one, if any. The audio is never touched: every file is checked against the original before it is replaced
+- **Save Image**: saves the cover next to the audio file instead, as `<file name> - Cover.jpg`
+- **3000 × 3000 px JPEG**, the size most distributors ask for
+- **Formats**: AIFF / AIF / AIFC, WAV, FLAC, MP3 and M4A (AAC and ALAC)
+
+### Good to know
+
+- **AIFF and WAV**: the cover goes in the file's ID3 tag. Every other chunk and every other tag (Apple Loops information, markers…) is kept byte for byte.
+- **FLAC, MP3 and M4A**: the file is rewritten by ffmpeg without re-encoding (stream copy), with its tags.
+- **Where covers show up**: AIFF, MP3 and M4A covers appear in the Finder, Music and most DJ software. WAV and FLAC covers are read by DJ software and many players, but the Finder doesn't show them (a macOS limitation).
+
+[`Make Cover/make-cover.sh`](Make%20Cover/make-cover.sh) is a readable copy of the script embedded in the workflow.
 
 ---
 
