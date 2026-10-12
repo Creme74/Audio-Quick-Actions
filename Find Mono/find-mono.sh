@@ -10,8 +10,11 @@
 #     Fake Mono    a mono signal panned to one side, or with one channel in
 #                  inverted polarity: converted if its box is ticked
 #     Left / Right channel only, Real stereo, Mono...
-# - Several files selected: only the files with something to do are listed (with
-#   the number of stereo and mono files found).
+# - Works on files and on folders: a folder is searched with all its subfolders,
+#   and only its WAV, AIFF, CAF and FLAC files are analyzed (every other file is
+#   ignored, and so are hidden files and the "Mono" folders made by Duplicate).
+# - Several files (or a folder) selected: only the files with something to do are
+#   listed (with the number of stereo and mono files found).
 # - Overwrite the originals, or duplicate them into a "Mono" subfolder.
 # - Nothing is recomputed: the mono file keeps one channel exactly as it was (bit
 #   for bit), and every converted file is checked against the original first.
@@ -497,10 +500,38 @@ maxjobs=$(/usr/sbin/sysctl -n hw.ncpu 2>/dev/null)
 (( maxjobs < 1 )) && maxjobs=1
 
 # --- 1. Scan (headers only) and analyze every file -----------------------------------
-files=() infos=()
-for f in "$@"; do [[ -f $f ]] && files+=("$f"); done
-(( ${#files} )) || exit 0
-infos=("${(@f)$(/usr/bin/perl "$pl" scan "${files[@]}")}")
+# Selected folders are searched with all their subfolders, for WAV, AIFF, CAF and
+# FLAC files only; every other file is ignored, and so are hidden files (such as
+# the "._" files macOS writes on external drives) and the "Mono" folders made by
+# Duplicate. Files found in a folder are shown with their path inside it.
+files=() labels=() infos=() folders=0
+add_folder() {   # folder
+  setopt localoptions extendedglob
+  local d=${1%/} g
+  for g in $d/**/*.(#i)(wav|aif|aiff|aifc|caf|flac)(N.n); do
+    [[ ${g#$d/} == (*/|)${copydir}/* ]] && continue
+    files+=("$g"); labels+=("${g#$d/}")
+  done
+}
+for f in "$@"; do
+  if [[ -d $f ]]; then
+    (( folders++ )); add_folder "$f"
+  elif [[ -f $f ]]; then
+    files+=("$f"); labels+=("${f##*/}")
+  fi
+done
+if (( ${#files} == 0 )); then
+  if (( folders == 1 )); then
+    alert "No lossless audio file found" "There is no WAV, AIFF, CAF or FLAC file in the selected folder."
+  elif (( folders > 1 )); then
+    alert "No lossless audio file found" "There is no WAV, AIFF, CAF or FLAC file in the selected folders."
+  fi
+  exit 0
+fi
+# headers are read 200 files at a time (long argument lists)
+for (( i = 1; i <= ${#files}; i += 200 )); do
+  infos+=("${(@f)$(/usr/bin/perl "$pl" scan "${(@)files[i,i+199]}")}")
+done
 
 if [[ ${(M)infos:#(pcm|flac) *} == "" ]]; then
   alert "No lossless audio file selected" "Find Mono works on WAV, AIFF, CAF and FLAC files."
@@ -525,10 +556,10 @@ todo=()           # fake stereo files: always converted
 keep=()           # channel kept for each file: 0 = left, 1 = right
 nopt=0         # files with a "Convert to mono" box
 # Several files selected: only the files with something to do are listed
-batch=$(( ${#files} > 1 ))
+batch=$(( ${#files} > 1 || folders > 0 ))
 n_mono=0 n_stereo=0 n_other=0 n_lossy=0   # files left out of the list
 for (( n = 1; n <= ${#files}; n++ )); do
-  name=${files[n]##*/}
+  name=${labels[n]}
   r=""
   [[ -f $tmpdir/a$n.res ]] && r=$(<"$tmpdir/a$n.res")
   info=(${=infos[n]})
@@ -2276,8 +2307,8 @@ for n in "${todo[@]}"; do
   [[ -f $tmpdir/$n.res ]] && r=$(<"$tmpdir/$n.res")
   case $r in
     ok)     (( done_count++ )) ;;
-    err\ *) errors+="${files[n]##*/}: ${r#err }"$'\n' ;;
-    *)      errors+="${files[n]##*/}: unknown error"$'\n' ;;
+    err\ *) errors+="${labels[n]}: ${r#err }"$'\n' ;;
+    *)      errors+="${labels[n]}: unknown error"$'\n' ;;
   esac
 done
 result="$(plural $done_count file) converted to mono"
