@@ -198,10 +198,14 @@ Gives every track its own cover, drawn from its own sound: the loudness of the w
   <img src="Docs/make-cover-screenshot.png" width="420" alt="Make Cover window">
 </p>
 
+<p align="center">
+  <img src="Docs/make-cover-gallery.png" width="720" alt="Sixteen covers made by Make Cover: Waveform and Circle styles, on dark and light backgrounds, in different colors">
+</p>
+
 ### Features
 
 - **Two styles**: *Waveform* (a mirrored waveform across the cover) or *Circle* (the waveform wrapped around a circle)
-- **Dark or Light background**, and **13 color gradients**: Vintage, Red Ink, Faded Red, Gold, Mono, Neon, Sunset, Ocean, Sky, Forest, Mint, Blush, Yellow
+- **Dark or Light background**, and **13 color gradients**: Vintage, Red Ink, Faded Red, Gold, Mono, Neon, Sunset, Ocean, Sky, Forest, Mint, Blush, Yellow. Each color has its own shades for each background: 52 different looks, and the shape is always the track's own
 - **Title and artist**: suggested from the file's tags, or from its name (`Artist - Title`), and editable. Untick **Show text** for a cover without text
 - **Live preview**: the cover is redrawn as you change the style, the colors or the text
 - **Several files at once**: each file gets its own cover; use ◀ ▶ to go through them and adjust each title and artist
