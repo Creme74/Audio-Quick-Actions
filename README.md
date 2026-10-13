@@ -11,7 +11,7 @@ A small collection of macOS Finder Quick Actions for music producers and sound d
 | [Normalize Peak](#normalize-peak) | Peak-normalizes lossless audio files without losing their metadata (Apple Loops tags included). |
 | [Normalize Loudness](#normalize-loudness) | Brings lossless audio files to a target loudness (Spotify, Apple Music, YouTube, broadcast or your own value), with a plain, transparent gain change. |
 | [Analyze Loudness](#analyze-loudness) | Measures the loudness (LUFS) and true peak of any audio file, and shows what each streaming platform would do with it. |
-| [Find Mono](#find-mono) | Finds mono audio hidden in stereo files and turns those files into real mono files, bit for bit. |
+| [Find Mono](#find-mono) | Finds mono audio hidden in stereo files, or in whole folders of samples, and turns those files into real mono files, bit for bit. |
 | [Make Cover](#make-cover) | Draws a cover from the waveform of each track and embeds it in the file, without touching the audio. |
 
 ---
@@ -48,7 +48,7 @@ The classic `sox` formula works too.
 2. Double-click the `.workflow` file and click **Install**.
 3. If it doesn't show up in the Finder's right-click menu, open **System Settings**, search for **Extensions**, go to **Finder** and tick it.
 
-To use it: select one or more audio files in the Finder, then right-click → **Quick Actions** → the Quick Action.
+To use it: select one or more audio files in the Finder (or a folder, for Find Mono), then right-click → **Quick Actions** → the Quick Action.
 
 ---
 
@@ -175,7 +175,9 @@ Sample packs and old projects are full of stereo files that are really mono: twi
 ### Features
 
 - **Batch friendly**: select a hundred files; when several files are selected, only the ones with something to do are listed, with the number of stereo and mono files found. If there is nothing to do: *All good, no hidden mono file found!*
-- **Overwrite or Duplicate**: replace the original files, or create mono copies in a `Mono` subfolder next to the originals (same file names)
+- **Whole folders**: right-click a folder (a sample pack, a project…) and Find Mono checks every WAV, AIFF, CAF and FLAC file in it, subfolders included. Every other file is ignored, and so are hidden files (such as the `._` files macOS writes on external drives) and the `Mono` folders made by Duplicate. Files are shown with their path inside the folder
+- **Tick all**: when several files need a decision (99.9% Mono, Fake Mono, one channel only), one box ticks them all
+- **Overwrite or Duplicate**: replace the original files, or create mono copies in a `Mono` subfolder next to the originals (same file names), in each of their folders
 - **Nothing is recomputed**: the mono file keeps one channel exactly as it was, bit for bit (the left one, or the louder one for a panned file). Every converted file is compared sample by sample with the original before it is kept
 - **Metadata stays intact**: for WAV, AIFF and CAF files, every chunk is kept byte for byte (Apple Loops information, markers, ID3 tags, sampler data…), except the ones that describe the channels. Finder tags and Spotlight comments are kept too
 - **Same format, same resolution**: bit depth and sample rate never change; FLAC files stay FLAC, with their tags and cover art
