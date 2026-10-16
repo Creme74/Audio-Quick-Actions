@@ -13,6 +13,7 @@ A small collection of macOS Finder Quick Actions for music producers and sound d
 | [Analyze Loudness](#analyze-loudness) | Measures the loudness (LUFS) and true peak of any audio file, and shows what each streaming platform would do with it. |
 | [Find Mono](#find-mono) | Finds mono audio hidden in stereo files, or in whole folders of samples, and turns those files into real mono files, bit for bit. |
 | [Make Cover](#make-cover) | Draws a cover from the waveform of each track and embeds it in the file, without touching the audio. |
+| [Clean Logic Samples](#clean-logic-samples) | Finds the library samples Logic Pro copied into your sessions and moves them to the Trash, never touching the library. |
 
 ---
 
@@ -32,8 +33,9 @@ A small collection of macOS Finder Quick Actions for music producers and sound d
 | Analyze Loudness | — | always |
 | Find Mono | — | always |
 | Make Cover | — | always |
+| Clean Logic Samples | — | — |
 
-The classic `sox` formula works too.
+The classic `sox` formula works too. Clean Logic Samples needs neither sox nor ffmpeg: it only uses tools built into macOS.
 
 **First run:** the first time a Quick Action works on files in your Downloads, Desktop or Documents folder, or on an external drive, macOS may ask whether *ffmpeg*, *ffprobe* or *sox* can access them. Click **Allow** for each one. If you clicked *Don't Allow*, go to **System Settings › Privacy & Security › Files and Folders**, find the tool and turn the folder or **Removable Volumes** back on. macOS may ask again after a Homebrew update.
 
@@ -45,6 +47,7 @@ The classic `sox` formula works too.
    - [Analyze-Loudness.zip](https://github.com/Creme74/Audio-Quick-Actions/releases/latest/download/Analyze-Loudness.zip)
    - [Find-Mono.zip](https://github.com/Creme74/Audio-Quick-Actions/releases/latest/download/Find-Mono.zip)
    - [Make-Cover.zip](https://github.com/Creme74/Audio-Quick-Actions/releases/latest/download/Make-Cover.zip)
+   - [Clean-Logic-Samples.zip](https://github.com/Creme74/Audio-Quick-Actions/releases/latest/download/Clean-Logic-Samples.zip)
 2. Double-click the `.workflow` file and click **Install**.
 3. If it doesn't show up in the Finder's right-click menu, open **System Settings**, search for **Extensions**, go to **Finder** and tick it.
 
@@ -223,6 +226,44 @@ Gives every track its own cover, drawn from its own sound: the loudness of the w
 - **Where covers show up**: AIFF, MP3 and M4A covers appear in the Finder, Music and most DJ software. WAV and FLAC covers are read by DJ software and many players, but the Finder doesn't show them (a macOS limitation).
 
 [`Make Cover/make-cover.sh`](Make%20Cover/make-cover.sh) is a readable copy of the script embedded in the workflow.
+
+---
+
+## Clean Logic Samples
+
+When you save a Logic Pro project with **Sampler Audio Data** ticked, Logic copies into the project folder the samples of every Sampler instrument it uses, including the instruments from your library. The same 1 GB piano can end up copied in dozens of sessions. Clean Logic Samples finds those copies and moves them to the Trash; when you open the session again, Logic finds the same samples in your library.
+
+<p align="center">
+  <img src="Docs/clean-logic-samples-screenshot.png" width="480" alt="Clean Logic Samples window">
+</p>
+
+### Features
+
+- **Whole folders**: right-click a folder of sessions (or a single session) and every Logic project in it is checked, subfolders included: Logic Pro X and later (`.logicx`), Logic 8 and 9 (`.logic`), Logic 7 and earlier (`.lso`)
+- **Only real copies**: a sample is removed only when your library holds a file with the same name and exactly the same content, compared byte for byte. Samples you recorded or made yourself, or changed, stay where they are
+- **Only inside sessions**: only the `Samples` folder of a Logic session is looked at. Samples anywhere else on your disk (sample packs, bounces, other folders) are never read
+- **Leftovers too**: samples of an instrument you removed from the project later are copies all the same, and are found too
+- **See before you clean**: every session is listed with its location, the space you get back and the instruments concerned. Untick the ones you want to keep, or use **Tick all**
+- **Nothing is deleted**: everything goes to the Trash, and *Put Back* works
+
+### Good to know
+
+- **The library is never touched**: `/Library/Application Support/Logic/Samples`, `EXS Factory Samples` and `~/Music/Audio Music Apps/Samples`, including the folders they link to (for instance a library moved to an external drive).
+- **External library**: if your library is on a drive that is not connected, its samples cannot be compared and stay in the sessions. The window tells you which library folders could not be reached.
+- **Large folders take time**: every candidate is compared byte for byte. Checking hundreds of sessions can take a few minutes before the window appears.
+- **Before emptying the Trash**, you can open a cleaned session in Logic to make sure everything plays as before.
+
+### Customization
+
+```zsh
+library=(                      # library folders: never touched, used for the comparison
+  "/Library/Application Support/Logic/Samples"
+  "/Library/Application Support/Logic/EXS Factory Samples"
+  "$HOME/Music/Audio Music Apps/Samples"
+)
+```
+
+[`Clean Logic Samples/clean-logic-samples.sh`](Clean%20Logic%20Samples/clean-logic-samples.sh) is a readable copy of the script embedded in the workflow.
 
 ---
 
