@@ -2442,6 +2442,7 @@ cover_job() {   # n file kind jpeg
   local n=$1 f=$2 kind=$3 jpg=$4 res="$tmpdir/$1.res"
   local new="$tmpdir/$n.new.${f:e}" part="${f:h}/.${f:t}.cover-part"
   local -a v1
+  local checked=0 xing
   case $kind in
     aiff|wav)
       if ! /usr/bin/perl "$pl" cover "$f" "$new" "$jpg" 2>/dev/null; then
@@ -2450,14 +2451,21 @@ cover_job() {   # n file kind jpeg
     mp3)
       # keep an ID3v1 tag if the file had one
       [[ $(tail -c 128 "$f" | head -c 3) == TAG ]] && v1=(-write_id3v1 1)
-      "$FFMPEG" -nostdin -v error -y -i "$f" -i "$jpg" -map 0:a -map 1 -c copy -map_metadata 0 \
-        -id3v2_version 3 "${v1[@]}" -metadata:s:v title="Album cover" -metadata:s:v comment="Cover (front)" \
-        -disposition:v:0 attached_pic "$new" || { rm -f "$new"; print -r -- "err ffmpeg failed" > "$res"; return } ;;
+      # ffmpeg adds an "Info" header (encoder delay) to the MP3 it writes; when the
+      # original had none, players would skip its first 12 ms, so the check fails:
+      # the file is then written again without that header
+      for xing in 1 0; do
+        "$FFMPEG" -nostdin -v error -y -i "$f" -i "$jpg" -map 0:a -map 1 -c copy -map_metadata 0 \
+          -id3v2_version 3 "${v1[@]}" -write_xing $xing -metadata:s:v title="Album cover" \
+          -metadata:s:v comment="Cover (front)" -disposition:v:0 attached_pic "$new" \
+          || { rm -f "$new"; print -r -- "err ffmpeg failed" > "$res"; return }
+        same_audio "$f" "$new" && { checked=1; break }
+      done ;;
     flac|m4a)
       "$FFMPEG" -nostdin -v error -y -i "$f" -i "$jpg" -map 0:a -map 1 -c copy -map_metadata 0 \
         -disposition:v:0 attached_pic "$new" || { rm -f "$new"; print -r -- "err ffmpeg failed" > "$res"; return } ;;
   esac
-  if ! same_audio "$f" "$new"; then
+  if (( ! checked )) && ! same_audio "$f" "$new"; then
     rm -f "$new"; print -r -- "err check failed, file not written" > "$res"; return
   fi
   if cp -p "$f" "$part" && cat "$new" > "$part" && mv -f "$part" "$f"; then
