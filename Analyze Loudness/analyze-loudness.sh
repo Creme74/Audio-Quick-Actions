@@ -1459,7 +1459,7 @@ for (( n = 1; n <= ${#files}; n++ )); do
   pids+=($!)
   if (( ${#pids} >= maxjobs )); then wait ${pids[1]}; shift pids; fi
 done
-wait
+wait ${pids[@]} 2>/dev/null
 progress_stop
 cancelled && exit 0
 

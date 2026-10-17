@@ -2149,7 +2149,7 @@ for (( n = 1; n <= ${#files}; n++ )); do
   fi
 done
 # files already started are finished even after Cancel: none is left half written
-wait
+wait ${pids[@]} 2>/dev/null
 progress_stop
 
 # --- 4. Summary ------------------------------------------------------------------

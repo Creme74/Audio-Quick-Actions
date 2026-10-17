@@ -15,6 +15,7 @@
 #           keeping the tags.
 #   Every file is checked (same audio as before) before it is replaced.
 # - Save Image: the cover is saved as a JPEG next to each file instead.
+# - Works on files and on folders (searched with all their subfolders).
 # - A progress window with a Cancel button shows while the files are analyzed and
 #   while the covers are added.
 #
@@ -1630,17 +1631,34 @@ progress_stop() {
 cancelled() { [[ -e $tmpdir/cancel ]] }
 
 # --- 1. Supported files -------------------------------------------------------------
-files=() kinds=() skipped=""
-for f in "$@"; do
-  [[ -f $f ]] || continue
-  case ${(L)f:e} in
-    aif|aiff|aifc) files+=("$f"); kinds+=(aiff) ;;
-    flac)          files+=("$f"); kinds+=(flac) ;;
-    mp3)           files+=("$f"); kinds+=(mp3) ;;
-    m4a)           files+=("$f"); kinds+=(m4a) ;;
-    wav)           files+=("$f"); kinds+=(wav) ;;
-    *)             skipped+="${f:t}: not an AIFF, WAV, FLAC, MP3 or M4A file"$'\n' ;;
+# Selected folders are searched with all their subfolders; only their AIFF, WAV,
+# FLAC, MP3 and M4A files are used (every other file is ignored, and so are hidden
+# files). Files found in a folder are shown with their path in it.
+files=() kinds=() labels=() skipped=""
+add_file() {   # file label
+  case ${(L)1:e} in
+    aif|aiff|aifc) kinds+=(aiff) ;;
+    flac)          kinds+=(flac) ;;
+    mp3)           kinds+=(mp3) ;;
+    m4a)           kinds+=(m4a) ;;
+    wav)           kinds+=(wav) ;;
+    *)             return 1 ;;
   esac
+  files+=("$1"); labels+=("$2")
+}
+add_folder() {   # folder
+  setopt localoptions extendedglob
+  local d=${1%/} g
+  for g in $d/**/*.(#i)(aif|aiff|aifc|flac|mp3|m4a|wav)(N.n); do
+    add_file "$g" "${g#$d/}"
+  done
+}
+for f in "$@"; do
+  if [[ -d $f ]]; then
+    add_folder "$f"
+  elif [[ -f $f ]]; then
+    add_file "$f" "${f:t}" || skipped+="${f:t}: not an AIFF, WAV, FLAC, MP3 or M4A file"$'\n'
+  fi
 done
 if (( ${#files} == 0 )); then
   alert "No file can get a cover" "Make Cover works on AIFF, WAV, FLAC, MP3 and M4A files."$'\n\n'"${skipped}"
@@ -1692,21 +1710,21 @@ progress_start "Make Cover"
 pids=()
 for (( n = 1; n <= ${#files}; n++ )); do
   cancelled && break
-  progress_set $(( n - 1 )) ${#files} "Analyzing $n of ${#files}" "${files[n]:t}"
+  progress_set $(( n - 1 )) ${#files} "Analyzing $n of ${#files}" "${labels[n]}"
   analyze $n "${files[n]}" "${kinds[n]}" &
   pids+=($!)
   if (( ${#pids} >= maxjobs )); then wait ${pids[1]}; shift pids; fi
 done
-wait
+wait ${pids[@]} 2>/dev/null
 progress_stop
 cancelled && exit 0
 
 ok=() names=()
 for (( n = 1; n <= ${#files}; n++ )); do
   if [[ -s $tmpdir/$n.env ]]; then
-    ok+=($n); names+=("${files[n]:t}")
+    ok+=($n); names+=("${labels[n]}")
   else
-    skipped+="${files[n]:t}: unreadable audio"$'\n'
+    skipped+="${labels[n]}: unreadable audio"$'\n'
   fi
 done
 if (( ${#ok} == 0 )); then
@@ -2457,7 +2475,7 @@ if [[ $answer == Save ]]; then
     if [[ -s $tmpdir/$n.jpg ]] && cp "$tmpdir/$n.jpg" "${f:h}/${f:t:r} - Cover.jpg"; then
       (( done_count++ ))
     else
-      errors+="${f:t}: could not save the image"$'\n'
+      errors+="${labels[n]}: could not save the image"$'\n'
     fi
   done
   result="$(plural $done_count cover) saved next to the audio files"
@@ -2469,7 +2487,7 @@ else
   for n in "${ok[@]}"; do
     cancelled && break
     (( k++ ))
-    progress_set $(( k - 1 )) ${#ok} "Adding cover $k of ${#ok}" "${files[n]:t}"
+    progress_set $(( k - 1 )) ${#ok} "Adding cover $k of ${#ok}" "${labels[n]}"
     if [[ ! -s $tmpdir/$n.jpg ]]; then
       print -r -- "err the cover could not be drawn" > "$tmpdir/$n.res"; continue
     fi
@@ -2477,15 +2495,15 @@ else
     pids+=($!)
     if (( ${#pids} >= maxjobs )); then wait ${pids[1]}; shift pids; fi
   done
-  wait
+  wait ${pids[@]} 2>/dev/null
   progress_stop
   for n in "${ok[@]}"; do
     r=""
     [[ -f $tmpdir/$n.res ]] && r=$(<"$tmpdir/$n.res")
     case $r in
       ok)     (( done_count++ )) ;;
-      err\ *) errors+="${files[n]:t}: ${r#err }"$'\n' ;;
-      *)      cancelled || errors+="${files[n]:t}: unknown error"$'\n' ;;
+      err\ *) errors+="${labels[n]}: ${r#err }"$'\n' ;;
+      *)      cancelled || errors+="${labels[n]}: unknown error"$'\n' ;;
     esac
   done
   result="Cover added to $(plural $done_count file)"
