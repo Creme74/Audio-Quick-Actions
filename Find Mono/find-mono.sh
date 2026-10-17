@@ -2186,7 +2186,7 @@ on buildAlert(fileSpecs, summaryText, overText, dupText, maxHeight)
 	set ca to current application
 	set textWidth to 440
 	-- Title, drawn here in red (NSAlert's own title cannot be colored)
-	set titleLabel to my lineLabel("Find Mono", true, 15, my redColor, textWidth)
+	set titleLabel to my lineLabel("Find Mono", true, 18, my redColor, textWidth)
 	set titleHeight to my lastHeight
 	-- Summary in red (white when all is good); the file counts under it (second line) in yellow
 	set body to ca's NSMutableAttributedString's alloc()'s init()

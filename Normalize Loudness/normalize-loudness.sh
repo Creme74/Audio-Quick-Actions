@@ -2121,7 +2121,7 @@ on buildAlert(fileSpecs, targetTitles, overText, dupText, maxHeight)
 	set my customRows to {}
 
 	-- Title, drawn here in red (NSAlert's own title cannot be colored)
-	set titleLabel to my lineLabel("", "Normalize Loudness", 15, my redColor, textWidth)
+	set titleLabel to my lineLabel("", "Normalize Loudness", 18, my redColor, textWidth)
 	set titleHeight to my lastHeight
 
 	-- One tab per menu item (targets, separator, Custom), each with the results of

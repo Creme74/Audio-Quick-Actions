@@ -1874,7 +1874,7 @@ on buildAlert(fileNames, overText, dupText, defaultLevel, levelList, maxHeight)
 	set ca to current application
 	set textWidth to 440
 	-- Title, drawn here in red (NSAlert's own title cannot be colored)
-	set titleLabel to my lineLabel("Normalize Peak", true, 15, my redColor, textWidth)
+	set titleLabel to my lineLabel("Normalize Peak", true, 18, my redColor, textWidth)
 	set titleHeight to my lastHeight
 	set names to my namesView(fileNames, textWidth, maxHeight)
 	set levelParts to my levelRow(levelList, defaultLevel, textWidth)

@@ -2075,7 +2075,7 @@ on buildAlert(addText, saveText, previewSize)
 	set heights to {}
 	set widths to {}
 
-	set end of views to my lineLabel("Make Cover", true, 15, my redColor, textWidth)
+	set end of views to my lineLabel("Make Cover", true, 18, my redColor, textWidth)
 	set end of heights to my lastHeight
 	set end of widths to textWidth
 

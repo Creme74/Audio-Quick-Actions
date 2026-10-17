@@ -1675,7 +1675,7 @@ on showResults(fileSpecs)
 	set isBatch to (count of platformTitles) &gt; 0
 
 	-- Title, drawn here in red (NSAlert's own title cannot be colored)
-	set titleLabel to my lineLabel("", "Analyze Loudness", 15, my redColor, textWidth)
+	set titleLabel to my lineLabel("", "Analyze Loudness", 18, my redColor, textWidth)
 	set titleHeight to my lastHeight
 
 	if not isBatch then
