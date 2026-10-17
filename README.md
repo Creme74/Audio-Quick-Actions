@@ -4,7 +4,7 @@
 
 # Audio Quick Actions
 
-A small collection of macOS Finder Quick Actions for music producers and sound designers. Select your audio files in the Finder, right-click, pick a Quick Action — that's it.
+A small collection of macOS Finder Quick Actions for music producers and sound designers. Select your audio files — or whole folders — in the Finder, right-click, pick a Quick Action — that's it.
 
 | Quick Action | What it does |
 |---|---|
@@ -13,6 +13,7 @@ A small collection of macOS Finder Quick Actions for music producers and sound d
 | [Analyze Loudness](#analyze-loudness) | Measures the loudness (LUFS) and true peak of any audio file, and shows what each streaming platform would do with it. |
 | [Find Mono](#find-mono) | Finds mono audio hidden in stereo files, or in whole folders of samples, and turns those files into real mono files, bit for bit. |
 | [Make Cover](#make-cover) | Draws a cover from the waveform of each track and embeds it in the file, without touching the audio. |
+| [Find Key](#find-key) | Finds the musical key of your tracks with a neural network, and writes it in their tags or at the start of their names. |
 | [Clean Logic Samples](#clean-logic-samples) | Finds the library samples Logic Pro copied into your sessions and moves them to the Trash, never touching the library. |
 
 ---
@@ -23,19 +24,20 @@ A small collection of macOS Finder Quick Actions for music producers and sound d
 - [Homebrew](https://brew.sh), then in Terminal:
 
   ```bash
-  brew install sox_ng ffmpeg
+  brew install sox_ng ffmpeg numpy
   ```
 
-| | `sox_ng` | `ffmpeg` |
-|---|---|---|
-| Normalize Peak | WAV, AIFF, CAF | FLAC only |
-| Normalize Loudness | WAV, AIFF, CAF | always (measurement and FLAC) |
-| Analyze Loudness | — | always |
-| Find Mono | — | always |
-| Make Cover | — | always |
-| Clean Logic Samples | — | — |
+| | `sox_ng` | `ffmpeg` | `numpy` |
+|---|---|---|---|
+| Normalize Peak | WAV, AIFF, CAF | FLAC only | — |
+| Normalize Loudness | WAV, AIFF, CAF | always (measurement and FLAC) | — |
+| Analyze Loudness | — | always | — |
+| Find Mono | — | always | — |
+| Make Cover | — | always | — |
+| Find Key | — | always | always |
+| Clean Logic Samples | — | — | — |
 
-The classic `sox` formula works too. Clean Logic Samples needs neither sox nor ffmpeg: it only uses tools built into macOS.
+The classic `sox` formula works too. `numpy` (with the Python that comes with it) is only needed by Find Key. Clean Logic Samples needs neither sox nor ffmpeg: it only uses tools built into macOS.
 
 **First run:** the first time a Quick Action works on files in your Downloads, Desktop or Documents folder, or on an external drive, macOS may ask whether *ffmpeg*, *ffprobe* or *sox* can access them. Click **Allow** for each one. If you clicked *Don't Allow*, go to **System Settings › Privacy & Security › Files and Folders**, find the tool and turn the folder or **Removable Volumes** back on. macOS may ask again after a Homebrew update.
 
@@ -47,11 +49,23 @@ The classic `sox` formula works too. Clean Logic Samples needs neither sox nor f
    - [Analyze-Loudness.zip](https://github.com/Creme74/Audio-Quick-Actions/releases/latest/download/Analyze-Loudness.zip)
    - [Find-Mono.zip](https://github.com/Creme74/Audio-Quick-Actions/releases/latest/download/Find-Mono.zip)
    - [Make-Cover.zip](https://github.com/Creme74/Audio-Quick-Actions/releases/latest/download/Make-Cover.zip)
+   - [Find-Key.zip](https://github.com/Creme74/Audio-Quick-Actions/releases/latest/download/Find-Key.zip)
    - [Clean-Logic-Samples.zip](https://github.com/Creme74/Audio-Quick-Actions/releases/latest/download/Clean-Logic-Samples.zip)
 2. Double-click the `.workflow` file and click **Install**.
 3. If it doesn't show up in the Finder's right-click menu, open **System Settings**, search for **Extensions**, go to **Finder** and tick it.
 
-To use it: select one or more audio files in the Finder (or a folder, for Find Mono), then right-click → **Quick Actions** → the Quick Action.
+To use it: select one or more audio files or folders in the Finder, then right-click → **Quick Actions** → the Quick Action.
+
+**Updating from an earlier version:** after installing the new `.workflow` files, the Finder may not offer a Quick Action on folders right away. Run this in Terminal to refresh its menu:
+
+```bash
+/System/Library/CoreServices/pbs -flush; /System/Library/CoreServices/pbs -update; killall Finder
+```
+
+### Folders and progress
+
+- **Folders**: every Quick Action works on folders as well as files. A folder is searched with all its subfolders; only the audio files a Quick Action can handle are used, hidden files are ignored. The `Normalized` folders made by Normalize Peak and Normalize Loudness, and the `Mono` folders made by Find Mono, are skipped by the Quick Action that made them. Files found in a folder are shown with their path inside it. (Clean Logic Samples works on folders only: see below.)
+- **Progress window**: while files are analyzed or processed, a window shows a progress bar, the file being worked on, and a **Cancel** button. It only appears when the work lasts more than a moment. If you cancel while files are being written, the ones already started are finished properly and the others are left as they were.
 
 ---
 
@@ -66,6 +80,7 @@ Normalizes the peak level of your audio files to the level you choose, while kee
 ### Features
 
 - **Choose your target level**: 0 dB, -0.1 dB, -0.2 dB, -0.5 dB or -1 dB
+- **Files or folders**: right-click a folder and every WAV, AIFF, CAF and FLAC file in it is normalized, subfolders included
 - **Overwrite or Duplicate**: replace the original files, or create normalized copies in a `Normalized` subfolder next to the originals (same file names)
 - **Metadata stays intact**: for WAV, AIFF and CAF files, only the audio samples are rewritten. Apple Loops information (tempo, key, tags, transients), markers, ID3 tags, Finder tags and Spotlight comments are all preserved
 - **Same format, same resolution**: a 16-bit / 44.1 kHz WAV stays a 16-bit / 44.1 kHz WAV. Bit depth (8, 16, 24, 32-bit integer or float) and sample rate never change
@@ -108,12 +123,13 @@ Measures the loudness of your audio files, shows the gain each one needs for the
 - **Choose your target** in the menu: Spotify Normal -14, Spotify Loud -11, Spotify Quiet -19, YouTube -14, Apple Music -16, Tidal -14, Amazon Music -14, Deezer -15, SoundCloud -14, Broadcast EBU R128 -23 LUFS
 - **Custom target**: pick **Custom…** at the bottom of the menu and type your own value (from -60 to 0 LUFS); the gains are updated as you type
 - **See before you apply**: the gain and the resulting loudness are shown for every file, for the selected target
+- **Files or folders**: right-click a folder and every WAV, AIFF, CAF and FLAC file in it is measured, subfolders included
 - **As transparent as possible**: a plain gain change — no compressor, no limiter, no EQ
 - **Overwrite or Duplicate**, **metadata stays intact**, **same format, same resolution**, **lossless formats only**: exactly like Normalize Peak. Other files (MP3, AAC/M4A…) are measured and shown, but never modified
 
 ### Good to know
 
-- **Quiet files with loud peaks**: loud files are always turned down to the target, but quiet files are only turned up until their true peak reaches -1 dBTP, so nothing clips. Such files may end up below the target; the window says *limited by true peak*. Reaching the target anyway would need a limiter, which would no longer be transparent.
+- **Quiet files with loud peaks**: loud files are always turned down to the target, but quiet files are only turned up until their true peak reaches -1 dBTP, so nothing clips. Such files may end up below the target; the window says *limited by true peak*. When a file has no room at all (its true peak is already at -1 dBTP or above), the window says in red *No gain added, the file would clip with +3.7 dB*: the gain it would need, if you want to reach the target yourself with a limiter. A limiter would no longer be transparent, so Normalize Loudness never uses one.
 - **Files already at the target** (0.0 dB gain): their audio is left untouched, only their modification date is updated (copied as is in Duplicate mode).
 - **16-bit files** get a light TPDF dither when the gain is applied.
 - **Overwrite cannot be undone.** Use Duplicate if you want to keep your originals.
@@ -144,6 +160,7 @@ Measures the loudness of your audio files and shows what each streaming platform
 ### Features
 
 - **Any audio format** ffmpeg can read: WAV, AIFF, CAF, FLAC, ALAC, MP3, AAC/M4A…
+- **Files or folders**: right-click a folder and every WAV, AIFF, CAF, FLAC, MP3, AAC/M4A, Ogg and Opus file in it is measured, subfolders included
 - **Integrated loudness** (LUFS) and **true peak** (dBTP), with the ITU-R BS.1770 / EBU R128 method
 - **Platform menu**: the gain Spotify (Normal, Loud, Quiet), YouTube, Apple Music, Tidal, Amazon Music, Deezer, SoundCloud or a broadcast EBU R128 delivery would apply to each file, track by track, with notes such as *not turned up*, *limited by true peak* or *limiter*
 - **Several files at once**: the results are listed under each file name, and one menu switches the platform for all of them
@@ -214,6 +231,7 @@ Gives every track its own cover, drawn from its own sound: the loudness of the w
 - **Title and artist**: suggested from the file's tags, or from its name (`Artist - Title`), and editable. Untick **Show text** for a cover without text
 - **Live preview**: the cover is redrawn as you change the style, the colors or the text
 - **Several files at once**: each file gets its own cover; use ◀ ▶ to go through them and adjust each title and artist
+- **Files or folders**: right-click a folder (an album, a playlist…) and every AIFF, WAV, FLAC, MP3 and M4A file in it gets its own cover, subfolders included
 - **Add Cover**: the cover is embedded in the file and replaces the existing one, if any. The audio is never touched: every file is checked against the original before it is replaced
 - **Save Image**: saves the cover next to the audio file instead, as `<file name> - Cover.jpg`
 - **3000 × 3000 px JPEG**, the size most distributors ask for
@@ -222,10 +240,35 @@ Gives every track its own cover, drawn from its own sound: the loudness of the w
 ### Good to know
 
 - **AIFF and WAV**: the cover goes in the file's ID3 tag. Every other chunk and every other tag (Apple Loops information, markers…) is kept byte for byte.
-- **FLAC, MP3 and M4A**: the file is rewritten by ffmpeg without re-encoding (stream copy), with its tags.
+- **FLAC, MP3 and M4A**: the file is rewritten by ffmpeg without re-encoding (stream copy), with its tags. MP3 files without an encoder *Info* header are kept without one, so they play exactly as before.
 - **Where covers show up**: AIFF, MP3 and M4A covers appear in the Finder, Music and most DJ software. WAV and FLAC covers are read by DJ software and many players, but the Finder doesn't show them (a macOS limitation).
 
 [`Make Cover/make-cover.sh`](Make%20Cover/make-cover.sh) is a readable copy of the script embedded in the workflow.
+
+---
+
+## Find Key
+
+Finds the musical key of your tracks, samples and loops, with a neural network trained on electronic and dance music, then writes it where your DJ software and your file browser can see it.
+
+### Features
+
+- **A neural network**: Find Key uses [MusicalKeyCNN](https://github.com/a1ex90/MusicalKeyCNN), a convolutional network after Korzeniowski & Widmer (*Genre-Agnostic Key Classification with Convolutional Neural Networks*, ISMIR 2018), trained on the GiantSteps key dataset. Its pipeline is rewritten with numpy only, and gives exactly the same keys as the original
+- **The whole track is analyzed**; short loops and samples are repeated first, so even a two-second loop gets a key
+- **A second opinion**: under each key, the next most likely one, such as *Could be A minor (14%)*
+- **Files or folders**: right-click a folder and every WAV, AIFF, FLAC and MP3 file in it is analyzed, subfolders included
+- **Add Key to Metadata**: the key goes into each file's tags, where Rekordbox, Traktor, Serato and Music read it (`Am`, `F#m`, `Eb`…): the ID3 tag of AIFF, WAV and MP3 files, the Vorbis comment of FLAC files. The audio itself is not modified: every file is checked against the original before it is replaced, and every other chunk and tag is kept
+- **Add Key to Filename**: the key goes at the start of each file name: `[F Minor] Kid Creme - At Night.wav`. A key already there is replaced, not added twice
+- **Copy to Clipboard**: the file names and their keys
+
+### Good to know
+
+- **How good is it?** On the GiantSteps test set, MusicalKeyCNN reaches a weighted score of 73.5. In a [2025 community comparison on r/DJs](https://www.reddit.com/r/DJs/comments/1ms1yds/key_detection_comparison_2025/), it found the right key for 79.4% of the tracks, behind Mixed In Key (85.2%) but ahead of Rekordbox (72.2%). No key detector is always right: trust your ears for the tracks that matter.
+- **The percentage is modest by nature**: the model spreads its probabilities over 24 keys, so even a right answer rarely shows a high figure. What counts is which key comes first.
+- **The model is inside the Quick Action** (`Find Key.workflow/Contents/Resources/keynet.npz`, 1.7 MB): nothing is sent anywhere, everything runs on your Mac.
+- **Requires** `ffmpeg` and `numpy`: `brew install ffmpeg numpy`.
+
+[`Find Key/find-key.sh`](Find%20Key/find-key.sh) is a readable copy of the script embedded in the workflow.
 
 ---
 
@@ -250,7 +293,7 @@ When you save a Logic Pro project with **Sampler Audio Data** ticked, Logic copi
 
 - **The library is never touched**: `/Library/Application Support/Logic/Samples`, `EXS Factory Samples` and `~/Music/Audio Music Apps/Samples`, including the folders they link to (for instance a library moved to an external drive).
 - **External library**: if your library is on a drive that is not connected, its samples cannot be compared and stay in the sessions. The window tells you which library folders could not be reached.
-- **Large folders take time**: every candidate is compared byte for byte. Checking hundreds of sessions can take a few minutes before the window appears.
+- **Large folders take time**: every candidate is compared byte for byte. Checking hundreds of sessions can take a few minutes; the progress window shows the library being read, then each session being checked, and **Cancel** stops the search (nothing has been moved yet at that point).
 - **Before emptying the Trash**, you can open a cleaned session in Logic to make sure everything plays as before.
 
 ### Customization
@@ -274,6 +317,8 @@ Delete the `.workflow` file from `~/Library/Services`.
 ## License
 
 This project is distributed under the **GPL-3.0-or-later** license — see [LICENSE](LICENSE).
+
+Find Key uses the trained model of [MusicalKeyCNN](https://github.com/a1ex90/MusicalKeyCNN) by Alexander Sommer, distributed under the MIT License — see [Find Key/MusicalKeyCNN-LICENSE.txt](Find%20Key/MusicalKeyCNN-LICENSE.txt).
 
 ## Author
 
