@@ -1791,7 +1791,7 @@ gain_awk='
         }
         if (g > -0.05 && g < 0.05) {
           g = 0
-          text = lim ? "Gain: 0.0 dB (limited by true peak)" : "Gain: 0.0 dB (already at target)"
+          text = (lim && t - i >= 0.05) ? sprintf("No gain added, the file would clip with %+.1f dB", t - i) : "Gain: 0.0 dB (already at target)"
         } else {
           text = sprintf("Gain: %+.1f dB → %.1f LUFS%s", g, i + g, lim ? " (limited by true peak)" : "")
         }
@@ -2001,7 +2001,7 @@ on gainText(i, tp, t)
 		end if
 	end if
 	if g > -0.05 and g < 0.05 then
-		if lim then return "Gain: 0.0 dB (limited by true peak)"
+		if lim and t - i >= 0.05 then return "No gain added, the file would clip with " & my tenths(t - i, true) & " dB"
 		return "Gain: 0.0 dB (already at target)"
 	end if
 	set s to "Gain: " & my tenths(g, true) & " dB " & (character id 8594) & " " & my tenths(i + g, false) & " LUFS"
@@ -2018,13 +2018,19 @@ on updateCustom()
 		if v is missing value then
 			set fresh to my lineLabel("", "Enter a target between -60 and 0 LUFS", 14, my yellowColor, 440)
 		else
-			set r to my gainText(item 2 of row, item 3 of row, v)
-			set cutPos to offset of ": " in r
-			set fresh to my lineLabel(text 1 thru (cutPos - 1) of r, text (cutPos + 2) thru -1 of r, 14, my yellowColor, 440)
+			set fresh to my gainLine(my gainText(item 2 of row, item 3 of row, v), 440)
 		end if
 		((item 1 of row)'s setAttributedStringValue:(fresh's attributedStringValue()))
 	end repeat
 end updateCustom
+
+-- The gain line: "Gain: ..." in yellow, "No gain added..." (it would clip) in red
+on gainLine(r, textWidth)
+	if r starts with "No gain" then return my lineLabel("", r, 14, my redColor, textWidth)
+	set cutPos to offset of ": " in r
+	if cutPos > 0 then return my lineLabel(text 1 thru (cutPos - 1) of r, text (cutPos + 2) thru -1 of r, 14, my yellowColor, textWidth)
+	return my lineLabel("", r, 14, my yellowColor, textWidth)
+end gainLine
 
 on customChanged:sender
 	my updateCustom()
@@ -2206,7 +2212,7 @@ on fileBlock(spec, textWidth, t)
 		set live to false
 		if t is 0 then
 			set r to item 4 of lns
-			if r starts with "Gain" then
+			if r starts with "Gain" or r starts with "No gain" then
 				set i to my numberOf(text 1 thru ((offset of " " in (item 2 of lns)) - 1) of (item 2 of lns))
 				set tp to my numberOf(text 1 thru ((offset of " " in (item 3 of lns)) - 1) of (item 3 of lns))
 				set r to my gainText(i, tp, -14.0)
@@ -2215,12 +2221,7 @@ on fileBlock(spec, textWidth, t)
 		else
 			set r to item (3 + t) of lns
 		end if
-		set cutPos to offset of ": " in r
-		if cutPos > 0 then
-			set gainLabel to my lineLabel(text 1 thru (cutPos - 1) of r, text (cutPos + 2) thru -1 of r, 14, my yellowColor, textWidth)
-		else
-			set gainLabel to my lineLabel("", r, 14, my yellowColor, textWidth)
-		end if
+		set gainLabel to my gainLine(r, textWidth)
 		set end of parts to gainLabel
 		set end of heights to my lastHeight
 		if live then set end of my customRows to {gainLabel, i, tp}
