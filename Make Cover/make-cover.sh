@@ -15,6 +15,8 @@
 #           keeping the tags.
 #   Every file is checked (same audio as before) before it is replaced.
 # - Save Image: the cover is saved as a JPEG next to each file instead.
+# - A progress window with a Cancel button shows while the files are analyzed and
+#   while the covers are added.
 #
 # Requires ffmpeg. Runs with /bin/zsh.
 
@@ -27,7 +29,7 @@ done
 FFPROBE=${FFMPEG%/*}/ffprobe
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/makecover.XXXXXX") || exit 1
-trap 'rm -rf "$tmpdir"' EXIT
+trap '[[ -n $progress_pid ]] && kill $progress_pid 2>/dev/null; rm -rf "$tmpdir"' EXIT
 pl="$tmpdir/cover.pl"
 
 # --- Helper ------------------------------------------------------------------------
@@ -247,97 +249,6 @@ maxjobs=$(/usr/sbin/sysctl -n hw.ncpu 2>/dev/null)
 [[ $maxjobs == <-> ]] || maxjobs=4
 (( maxjobs > 6 )) && maxjobs=6
 (( maxjobs < 1 )) && maxjobs=1
-
-# --- 1. Supported files -------------------------------------------------------------
-files=() kinds=() skipped=""
-for f in "$@"; do
-  [[ -f $f ]] || continue
-  case ${(L)f:e} in
-    aif|aiff|aifc) files+=("$f"); kinds+=(aiff) ;;
-    flac)          files+=("$f"); kinds+=(flac) ;;
-    mp3)           files+=("$f"); kinds+=(mp3) ;;
-    m4a)           files+=("$f"); kinds+=(m4a) ;;
-    wav)           files+=("$f"); kinds+=(wav) ;;
-    *)             skipped+="${f:t}: not an AIFF, WAV, FLAC, MP3 or M4A file"$'\n' ;;
-  esac
-done
-if (( ${#files} == 0 )); then
-  alert "No file can get a cover" "Make Cover works on AIFF, WAV, FLAC, MP3 and M4A files."$'\n\n'"${skipped}"
-  exit 0
-fi
-
-# --- 2. Waveform, title and artist of every file (several at a time) -------------------
-# $tmpdir/<n>.env: title / artist / 900 loudness values (0..1, comma separated)
-
-# "i'm the baddest bitch" -> "I'm The Baddest Bitch" (only when no word but the
-# first one starts with a capital letter: names written on purpose are left alone)
-tidy() {
-  print -r -- "$1" | /usr/bin/perl -CSD -ne 'chomp; s/_/ /g; s/\s+/ /g; s/^ | $//g;
-    my @w = split / /; s/(\w[\w\x27]*)/\u\L$1/g unless grep { /^\p{Lu}/ } @w[1 .. $#w]; print "$_\n"'
-}
-# Suggestion: the tags first, else the file name ("01 - Artist - Title")
-suggest() {   # file kind -> two lines: title, artist
-  local t="" a="" base
-  if [[ $2 == aiff ]]; then
-    local -a tg
-    tg=("${(@f)$(/usr/bin/perl "$pl" aifftags "$1" 2>/dev/null)}")
-    t=${tg[1]}; a=${tg[2]}
-  else
-    t=$("$FFPROBE" -v error -show_entries format_tags=title -of default=nw=1:nk=1 "$1" 2>/dev/null | head -1)
-    a=$("$FFPROBE" -v error -show_entries format_tags=artist -of default=nw=1:nk=1 "$1" 2>/dev/null | head -1)
-  fi
-  base=${1:t:r}; base=${base//_/ }
-  base=$(print -r -- "$base" | /usr/bin/perl -pe 's/^\s*(\d{1,3}\s*[-.)]\s*|0\d\s+)//')
-  if [[ $base == *" - "* ]]; then
-    [[ -z ${a//[[:space:]]/} ]] && a=${base%% - *}
-    [[ -z ${t//[[:space:]]/} ]] && t=${base#* - }
-  elif [[ -z ${t//[[:space:]]/} ]]; then
-    t=$base
-  fi
-  print -r -- "$(tidy "$t")"
-  print -r -- "$(tidy "$a")"
-}
-analyze() {   # n file kind
-  local e
-  local -a s
-  s=("${(@f)$(suggest "$2" "$3")}")
-  e=$("$FFMPEG" -nostdin -v error -i "$2" -map 0:a:0 -ac 1 -ar 11025 -f s16le - 2>/dev/null \
-        | /usr/bin/perl "$pl" env 900)
-  [[ -n $e ]] || return
-  print -r -- "${s[1]}"$'\n'"${s[2]}"$'\n'"$e" > "$tmpdir/$1.env"
-}
-
-pids=()
-for (( n = 1; n <= ${#files}; n++ )); do
-  analyze $n "${files[n]}" "${kinds[n]}" &
-  pids+=($!)
-  if (( ${#pids} >= maxjobs )); then wait ${pids[1]}; shift pids; fi
-done
-wait
-
-ok=() names=()
-for (( n = 1; n <= ${#files}; n++ )); do
-  if [[ -s $tmpdir/$n.env ]]; then
-    ok+=($n); names+=("${files[n]:t}")
-  else
-    skipped+="${files[n]:t}: unreadable audio"$'\n'
-  fi
-done
-if (( ${#ok} == 0 )); then
-  alert "No file can get a cover" "${skipped}"
-  exit 0
-fi
-
-# --- 3. Window: preview, colors, title -------------------------------------------------
-if (( ${#ok} == 1 )); then
-  add_text="Add Cover: embed the cover in the file. The audio is not touched."
-  save_text="Save Image: save the cover as a JPEG next to the file."
-else
-  add_text="Add Cover: embed its own cover in each file. The audio is not touched."
-  save_text="Save Image: save the covers as JPEG files next to the audio files."
-fi
-envs=()
-for n in "${ok[@]}"; do envs+=("$tmpdir/$n.env"); done
 
 /usr/bin/base64 --decode > "$tmpdir/icon.png" 2>/dev/null <<'ICON'
 iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAEAAElEQVR42uy9d5hkV3H+/znnps49
@@ -1554,6 +1465,266 @@ i4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uL
 i4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLy3uW/xelrsbi0etWdgAAAABJ
 RU5ErkJggg==
 ICON
+
+# --- Progress window --------------------------------------------------------------------
+# While the files are analyzed or processed, a small window shows a progress bar, the
+# file being worked on, and a Cancel button. It only appears when the work lasts more
+# than a moment.
+#   progress_start TITLE         opens it (in the background)
+#   progress_set DONE TOTAL TEXT [DETAIL]
+#   progress_stop                closes it
+#   cancelled                    true once Cancel was clicked
+cat > "$tmpdir/progress.applescript" <<'APPLESCRIPT'
+use AppleScript version "2.4"
+use framework "Foundation"
+use framework "AppKit"
+use scripting additions
+
+property progressPath : ""
+property cancelPath : ""
+property progressBar : missing value
+property mainLabel : missing value
+property detailLabel : missing value
+property centerValue : 1
+
+-- Arguments: title, progress file, cancel file, icon.
+-- The progress file holds three lines: "DONE TOTAL", the main text, the detail (a
+-- file name). With a TOTAL of 0 the bar just moves (amount not known yet). The window
+-- closes when the file is gone; Cancel creates the cancel file.
+on run argv
+	set ca to current application
+	set titleText to item 1 of argv
+	set my progressPath to item 2 of argv
+	set my cancelPath to item 3 of argv
+	set iconPath to item 4 of argv
+	-- short work: no window at all
+	delay 0.6
+	if not (my progressExists()) then return
+	if (do shell script "/usr/bin/uname -m") is "x86_64" then set my centerValue to 2
+	set textWidth to 360
+	set redColor to ca's NSColor's colorWithSRGBRed:0.94 green:0.58 blue:0.47 alpha:1.0
+	set yellowColor to ca's NSColor's colorWithSRGBRed:0.78 green:0.72 blue:0.48 alpha:0.85
+
+	set titleLabel to my makeLabel(titleText, ca's NSFont's boldSystemFontOfSize:18, redColor, textWidth, 24)
+	set my mainLabel to my makeLabel("Starting" & (character id 8230), ca's NSFont's boldSystemFontOfSize:14, ca's NSColor's labelColor(), textWidth, 20)
+	set my detailLabel to my makeLabel("", ca's NSFont's systemFontOfSize:12, yellowColor, textWidth, 18)
+	(my detailLabel)'s setLineBreakMode:5 -- truncate in the middle
+	set my progressBar to ca's NSProgressIndicator's alloc()'s initWithFrame:{{0, 0}, {textWidth, 20}}
+	(my progressBar)'s setStyle:0 -- bar
+	(my progressBar)'s setIndeterminate:false
+	(my progressBar)'s setMinValue:0
+	(my progressBar)'s setMaxValue:1
+	(my progressBar)'s setDoubleValue:0
+
+	-- top to bottom: title, main text, bar, file name (AppKit's y axis goes up)
+	set container to ca's NSView's alloc()'s initWithFrame:{{0, 0}, {textWidth, 108}}
+	titleLabel's setFrameOrigin:{0, 84}
+	(my mainLabel)'s setFrameOrigin:{0, 56}
+	(my progressBar)'s setFrameOrigin:{0, 28}
+	(my detailLabel)'s setFrameOrigin:{0, 2}
+	repeat with v in {titleLabel, my mainLabel, my progressBar, my detailLabel}
+		container's addSubview:(contents of v)
+	end repeat
+
+	set theAlert to ca's NSAlert's alloc()'s init()
+	theAlert's setMessageText:""
+	theAlert's setInformativeText:""
+	set img to ca's NSImage's alloc()'s initWithContentsOfFile:iconPath
+	if img is not missing value then theAlert's setIcon:img
+	theAlert's setAccessoryView:container
+	set cancelButton to theAlert's addButtonWithTitle:"Cancel"
+	cancelButton's setKeyEquivalent:(character id 27)
+	theAlert's layout()
+	my tick:(missing value)
+	try
+		ca's NSApplication's sharedApplication()'s setActivationPolicy:1
+	end try
+	try
+		(theAlert's |window|())'s setLevel:3
+	end try
+	ca's NSApplication's sharedApplication()'s activateIgnoringOtherApps:true
+	set t to ca's NSTimer's timerWithTimeInterval:0.2 target:me selector:"tick:" userInfo:(missing value) repeats:true
+	(ca's NSRunLoop's currentRunLoop())'s addTimer:t forMode:(ca's NSModalPanelRunLoopMode)
+	set response to (theAlert's runModal()) as integer
+	t's invalidate()
+	-- Cancel (the work is still going on): tell the script
+	if response = 1000 then
+		(ca's NSString's stringWithString:"cancel")'s writeToFile:(my cancelPath) atomically:true encoding:4 |error|:(missing value)
+	end if
+end run
+
+on makeLabel(theText, theFont, theColor, textWidth, h)
+	set ca to current application
+	set field to ca's NSTextField's labelWithString:theText
+	field's setFont:theFont
+	field's setTextColor:theColor
+	field's setAlignment:(my centerValue)
+	field's setFrame:{{0, 0}, {textWidth, h}}
+	return field
+end makeLabel
+
+on progressExists()
+	return ((current application's NSFileManager's defaultManager()'s fileExistsAtPath:(my progressPath)) as boolean)
+end progressExists
+
+-- Every 0.2 s: read the progress file and update the window, or close it
+on tick:theTimer
+	set ca to current application
+	try
+		set s to ca's NSString's stringWithContentsOfFile:(my progressPath) encoding:4 |error|:(missing value)
+		if s is missing value then
+			if not (my progressExists()) then ca's NSApplication's sharedApplication()'s stopModalWithCode:2000
+			return
+		end if
+		set lns to paragraphs of (s as text)
+		if (count of lns) < 1 then return
+		set nums to words of (item 1 of lns)
+		set doneCount to (item 1 of nums) as real
+		set total to (item 2 of nums) as real
+		if total > 0 then
+			(my progressBar)'s stopAnimation:(missing value)
+			(my progressBar)'s setIndeterminate:false
+			(my progressBar)'s setMaxValue:total
+			(my progressBar)'s setDoubleValue:doneCount
+		else
+			-- total not known yet: a moving bar
+			(my progressBar)'s setIndeterminate:true
+			(my progressBar)'s startAnimation:(missing value)
+		end if
+		if (count of lns) > 1 then (my mainLabel)'s setStringValue:(item 2 of lns)
+		if (count of lns) > 2 then
+			(my detailLabel)'s setStringValue:(item 3 of lns)
+		else
+			(my detailLabel)'s setStringValue:""
+		end if
+	end try
+end tick:
+APPLESCRIPT
+
+progress_pid=""
+progress_start() {   # title
+  rm -f "$tmpdir/cancel"
+  print -r -- "0 0"$'\n'"Starting…" > "$tmpdir/progress"
+  /usr/bin/osascript "$tmpdir/progress.applescript" "$1" "$tmpdir/progress" \
+    "$tmpdir/cancel" "$tmpdir/icon.png" >/dev/null 2>&1 &
+  progress_pid=$!
+}
+progress_set() {   # done total text [detail]
+  [[ -n $progress_pid ]] || return 0
+  print -r -- "$1 $2"$'\n'"$3"$'\n'"${4:-}" > "$tmpdir/progress.tmp" \
+    && mv -f "$tmpdir/progress.tmp" "$tmpdir/progress"
+}
+progress_stop() {
+  [[ -n $progress_pid ]] || return 0
+  rm -f "$tmpdir/progress"
+  # the window closes itself within 0.2 s once the file is gone
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 $progress_pid 2>/dev/null || break
+    sleep 0.1
+  done
+  kill $progress_pid 2>/dev/null
+  wait $progress_pid 2>/dev/null
+  progress_pid=""
+}
+cancelled() { [[ -e $tmpdir/cancel ]] }
+
+# --- 1. Supported files -------------------------------------------------------------
+files=() kinds=() skipped=""
+for f in "$@"; do
+  [[ -f $f ]] || continue
+  case ${(L)f:e} in
+    aif|aiff|aifc) files+=("$f"); kinds+=(aiff) ;;
+    flac)          files+=("$f"); kinds+=(flac) ;;
+    mp3)           files+=("$f"); kinds+=(mp3) ;;
+    m4a)           files+=("$f"); kinds+=(m4a) ;;
+    wav)           files+=("$f"); kinds+=(wav) ;;
+    *)             skipped+="${f:t}: not an AIFF, WAV, FLAC, MP3 or M4A file"$'\n' ;;
+  esac
+done
+if (( ${#files} == 0 )); then
+  alert "No file can get a cover" "Make Cover works on AIFF, WAV, FLAC, MP3 and M4A files."$'\n\n'"${skipped}"
+  exit 0
+fi
+
+# --- 2. Waveform, title and artist of every file (several at a time) -------------------
+# $tmpdir/<n>.env: title / artist / 900 loudness values (0..1, comma separated)
+
+# "i'm the baddest bitch" -> "I'm The Baddest Bitch" (only when no word but the
+# first one starts with a capital letter: names written on purpose are left alone)
+tidy() {
+  print -r -- "$1" | /usr/bin/perl -CSD -ne 'chomp; s/_/ /g; s/\s+/ /g; s/^ | $//g;
+    my @w = split / /; s/(\w[\w\x27]*)/\u\L$1/g unless grep { /^\p{Lu}/ } @w[1 .. $#w]; print "$_\n"'
+}
+# Suggestion: the tags first, else the file name ("01 - Artist - Title")
+suggest() {   # file kind -> two lines: title, artist
+  local t="" a="" base
+  if [[ $2 == aiff ]]; then
+    local -a tg
+    tg=("${(@f)$(/usr/bin/perl "$pl" aifftags "$1" 2>/dev/null)}")
+    t=${tg[1]}; a=${tg[2]}
+  else
+    t=$("$FFPROBE" -v error -show_entries format_tags=title -of default=nw=1:nk=1 "$1" 2>/dev/null | head -1)
+    a=$("$FFPROBE" -v error -show_entries format_tags=artist -of default=nw=1:nk=1 "$1" 2>/dev/null | head -1)
+  fi
+  base=${1:t:r}; base=${base//_/ }
+  base=$(print -r -- "$base" | /usr/bin/perl -pe 's/^\s*(\d{1,3}\s*[-.)]\s*|0\d\s+)//')
+  if [[ $base == *" - "* ]]; then
+    [[ -z ${a//[[:space:]]/} ]] && a=${base%% - *}
+    [[ -z ${t//[[:space:]]/} ]] && t=${base#* - }
+  elif [[ -z ${t//[[:space:]]/} ]]; then
+    t=$base
+  fi
+  print -r -- "$(tidy "$t")"
+  print -r -- "$(tidy "$a")"
+}
+analyze() {   # n file kind
+  local e
+  local -a s
+  s=("${(@f)$(suggest "$2" "$3")}")
+  e=$("$FFMPEG" -nostdin -v error -i "$2" -map 0:a:0 -ac 1 -ar 11025 -f s16le - 2>/dev/null \
+        | /usr/bin/perl "$pl" env 900)
+  [[ -n $e ]] || return
+  print -r -- "${s[1]}"$'\n'"${s[2]}"$'\n'"$e" > "$tmpdir/$1.env"
+}
+
+progress_start "Make Cover"
+pids=()
+for (( n = 1; n <= ${#files}; n++ )); do
+  cancelled && break
+  progress_set $(( n - 1 )) ${#files} "Analyzing $n of ${#files}" "${files[n]:t}"
+  analyze $n "${files[n]}" "${kinds[n]}" &
+  pids+=($!)
+  if (( ${#pids} >= maxjobs )); then wait ${pids[1]}; shift pids; fi
+done
+wait
+progress_stop
+cancelled && exit 0
+
+ok=() names=()
+for (( n = 1; n <= ${#files}; n++ )); do
+  if [[ -s $tmpdir/$n.env ]]; then
+    ok+=($n); names+=("${files[n]:t}")
+  else
+    skipped+="${files[n]:t}: unreadable audio"$'\n'
+  fi
+done
+if (( ${#ok} == 0 )); then
+  alert "No file can get a cover" "${skipped}"
+  exit 0
+fi
+
+# --- 3. Window: preview, colors, title -------------------------------------------------
+if (( ${#ok} == 1 )); then
+  add_text="Add Cover: embed the cover in the file. The audio is not touched."
+  save_text="Save Image: save the cover as a JPEG next to the file."
+else
+  add_text="Add Cover: embed its own cover in each file. The audio is not touched."
+  save_text="Save Image: save the covers as JPEG files next to the audio files."
+fi
+envs=()
+for n in "${ok[@]}"; do envs+=("$tmpdir/$n.env"); done
+
 # The window and the covers are drawn by AppKit (AppleScriptObjC), with
 # AppleLoopEditor's coral red (logoRed) and vintage yellow (vintageYellow).
 cat > "$tmpdir/dialog.applescript" <<'APPLESCRIPT'
@@ -2292,8 +2463,13 @@ if [[ $answer == Save ]]; then
   result="$(plural $done_count cover) saved next to the audio files"
   (( done_count == 1 )) && result="1 cover saved next to the audio file"
 else
+  progress_start "Make Cover"
+  k=0
   pids=()
   for n in "${ok[@]}"; do
+    cancelled && break
+    (( k++ ))
+    progress_set $(( k - 1 )) ${#ok} "Adding cover $k of ${#ok}" "${files[n]:t}"
     if [[ ! -s $tmpdir/$n.jpg ]]; then
       print -r -- "err the cover could not be drawn" > "$tmpdir/$n.res"; continue
     fi
@@ -2302,16 +2478,18 @@ else
     if (( ${#pids} >= maxjobs )); then wait ${pids[1]}; shift pids; fi
   done
   wait
+  progress_stop
   for n in "${ok[@]}"; do
     r=""
     [[ -f $tmpdir/$n.res ]] && r=$(<"$tmpdir/$n.res")
     case $r in
       ok)     (( done_count++ )) ;;
       err\ *) errors+="${files[n]:t}: ${r#err }"$'\n' ;;
-      *)      errors+="${files[n]:t}: unknown error"$'\n' ;;
+      *)      cancelled || errors+="${files[n]:t}: unknown error"$'\n' ;;
     esac
   done
   result="Cover added to $(plural $done_count file)"
+  cancelled && result+=" (cancelled)"
 fi
 
 report=""

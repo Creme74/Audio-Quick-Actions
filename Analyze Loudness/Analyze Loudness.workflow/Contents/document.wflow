@@ -68,8 +68,9 @@
 #   (Loud -11, Normal -14, Quiet -19 LUFS), track by track: loud files are turned
 #   down; quiet files are turned up only as far as the true peak allows (Spotify
 #   keeps 1 dB of headroom), except in Loud mode, where a limiter is used.
-# - Any audio format ffmpeg can read (WAV, AIFF, CAF, FLAC, ALAC, MP3, AAC/M4A...).
-#   Nothing is modified.
+# - Works on files and on folders (searched with all their subfolders): WAV, AIFF, CAF,
+#   FLAC, ALAC, MP3, AAC/M4A, Ogg, Opus. Nothing is modified.
+# - A progress window with a Cancel button shows while the files are measured.
 #
 # Requires ffmpeg. Runs with /bin/zsh.
 
@@ -80,7 +81,7 @@ done
 export LC_NUMERIC=C
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/loudness.XXXXXX") || exit 1
-trap 'rm -rf "$tmpdir"' EXIT
+trap '[[ -n $progress_pid ]] &amp;&amp; kill $progress_pid 2&gt;/dev/null; rm -rf "$tmpdir"' EXIT
 
 notify() {
   /usr/bin/osascript -e 'on run argv' \
@@ -93,97 +94,6 @@ if [[ -z $FFMPEG ]]; then
   exit 0
 fi
 
-# --- 1. Measure every file (several at a time) -------------------------------------
-# Each job writes "I TP LRA" (or "err") to $tmpdir/&lt;n&gt;.res
-measure() {   # n file
-  "$FFMPEG" -nostdin -hide_banner -nostats -i "$2" -map 0:a:0 \
-      -af ebur128=peak=true:framelog=quiet -f null - 2&gt;&amp;1 \
-    | awk '/Summary:/ { s = 1 }
-           s &amp;&amp; $1 == "I:"    { i = $2 }
-           s &amp;&amp; $1 == "LRA:"  { l = $2 }
-           s &amp;&amp; $1 == "Peak:" { p = $2 }
-           END { if (i == "") print "err"; else print i, p, l }' &gt; "$tmpdir/$1.res"
-}
-
-files=()
-for f in "$@"; do [[ -f $f ]] &amp;&amp; files+=("$f"); done
-(( ${#files} )) || exit 0
-
-maxjobs=$(/usr/sbin/sysctl -n hw.ncpu 2&gt;/dev/null)
-[[ $maxjobs == &lt;-&gt; ]] || maxjobs=4
-(( maxjobs &gt; 6 )) &amp;&amp; maxjobs=6
-pids=()
-for (( n = 1; n &lt;= ${#files}; n++ )); do
-  measure $n "${files[n]}" &amp;
-  pids+=($!)
-  if (( ${#pids} &gt;= maxjobs )); then wait ${pids[1]}; shift pids; fi
-done
-wait
-
-# --- 2. Results ---------------------------------------------------------------------
-# Gain each platform applies to a track (track mode). "up" platforms turn quiet
-# tracks up only while the true peak stays at or below -1 dBTP; "down" platforms
-# never turn up; "limiter" reaches the target in any case (Spotify Loud);
-# "exact" is a delivery target (broadcast).
-platforms=(
-  "Spotify Normal:-14:up"
-  "Spotify Loud:-11:limiter"
-  "Spotify Quiet:-19:up"
-  "YouTube:-14:down"
-  "Apple Music:-16:down"
-  "Tidal:-14:up"
-  "Amazon Music:-14:up"
-  "Deezer:-15:up"
-  "SoundCloud:-14:down"
-  "Broadcast EBU R128:-23:exact"
-)
-
-specs=()     # one entry per file, lines: name / loudness / true peak / menu items
-plain=""     # same results as plain text, for "Copy Results"
-for (( n = 1; n &lt;= ${#files}; n++ )); do
-  name=${files[n]##*/}
-  r=""
-  [[ -f $tmpdir/$n.res ]] &amp;&amp; r=$(&lt;"$tmpdir/$n.res")
-  if [[ -z $r || $r == err ]]; then
-    specs+=("${name}"$'\n'"!Not an audio file, or unreadable")
-    plain+="${name}"$'\n'"Not an audio file, or unreadable"$'\n\n'
-    continue
-  fi
-  out=$(print -r -- "$r" | awk -v plats="${(j:|:)platforms}" '
-    function fmt(g) { if (g &gt; -0.05 &amp;&amp; g &lt; 0.05) return "0.0 dB"; return sprintf("%+.1f dB", g) }
-    { i = $1; tp = $2 }
-    END {
-      if (i &lt;= -70) { print "silent"; exit }
-      printf "%.1f LUFS\n%+.1f dBTP\n", i, tp
-      np = split(plats, P, "|")
-      for (k = 1; k &lt;= np; k++) {
-        split(P[k], f, ":"); label = f[1]; t = f[2] + 0; mode = f[3]
-        g = t - i; note = ""
-        if (g &gt; 0) {
-          if (mode == "down") { g = 0; note = " (not turned up)" }
-          else if (mode == "up") {
-            room = -1 - tp; if (room &lt; 0) room = 0
-            if (g &gt; room) { g = room; note = " (limited by true peak)" }
-          }
-          else if (mode == "limiter" &amp;&amp; tp + g &gt; -1) note = " (limiter)"
-        }
-        printf "%s %d LUFS: %s%s\n", label, t, fmt(g), note
-      }
-    }')
-  if [[ $out == silent ]]; then
-    specs+=("${name}"$'\n'"!Silent (below -70 LUFS)")
-    plain+="${name}"$'\n'"Silent (below -70 LUFS)"$'\n\n'
-    continue
-  fi
-  specs+=("${name}"$'\n'"${out}")
-  lines=("${(@f)out}")
-  plain+="${name}"$'\n'"Loudness: ${lines[1]}"$'\n'"True peak: ${lines[2]}"$'\n'
-  plain+="${lines[3]}"$'\n'      # default platform (Spotify Normal -14 LUFS)
-  plain+=$'\n'
-done
-while [[ $plain == *$'\n' ]]; do plain=${plain%$'\n'}; done   # no trailing blank lines
-
-# --- 3. Window -------------------------------------------------------------------------
 /usr/bin/base64 --decode &gt; "$tmpdir/icon.png" 2&gt;/dev/null &lt;&lt;'ICON'
 iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAEAAElEQVR42uy9d5hkV3H+/znnps49
 3ZNnNmdtUM5IQggUABEMSASbYIwTJgf764QkLIxtwIDBgAkGbEwQIiogIYRyDrta7WpznJ2dPNO5
@@ -1400,6 +1310,285 @@ i4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLy3uW/xelrsbi0etWdgAAAABJ
 RU5ErkJggg==
 ICON
 
+# --- Progress window --------------------------------------------------------------------
+# While the files are analyzed or processed, a small window shows a progress bar, the
+# file being worked on, and a Cancel button. It only appears when the work lasts more
+# than a moment.
+#   progress_start TITLE         opens it (in the background)
+#   progress_set DONE TOTAL TEXT [DETAIL]
+#   progress_stop                closes it
+#   cancelled                    true once Cancel was clicked
+cat &gt; "$tmpdir/progress.applescript" &lt;&lt;'APPLESCRIPT'
+use AppleScript version "2.4"
+use framework "Foundation"
+use framework "AppKit"
+use scripting additions
+
+property progressPath : ""
+property cancelPath : ""
+property progressBar : missing value
+property mainLabel : missing value
+property detailLabel : missing value
+property centerValue : 1
+
+-- Arguments: title, progress file, cancel file, icon.
+-- The progress file holds three lines: "DONE TOTAL", the main text, the detail (a
+-- file name). With a TOTAL of 0 the bar just moves (amount not known yet). The window
+-- closes when the file is gone; Cancel creates the cancel file.
+on run argv
+	set ca to current application
+	set titleText to item 1 of argv
+	set my progressPath to item 2 of argv
+	set my cancelPath to item 3 of argv
+	set iconPath to item 4 of argv
+	-- short work: no window at all
+	delay 0.6
+	if not (my progressExists()) then return
+	if (do shell script "/usr/bin/uname -m") is "x86_64" then set my centerValue to 2
+	set textWidth to 360
+	set redColor to ca's NSColor's colorWithSRGBRed:0.94 green:0.58 blue:0.47 alpha:1.0
+	set yellowColor to ca's NSColor's colorWithSRGBRed:0.78 green:0.72 blue:0.48 alpha:0.85
+
+	set titleLabel to my makeLabel(titleText, ca's NSFont's boldSystemFontOfSize:18, redColor, textWidth, 24)
+	set my mainLabel to my makeLabel("Starting" &amp; (character id 8230), ca's NSFont's boldSystemFontOfSize:14, ca's NSColor's labelColor(), textWidth, 20)
+	set my detailLabel to my makeLabel("", ca's NSFont's systemFontOfSize:12, yellowColor, textWidth, 18)
+	(my detailLabel)'s setLineBreakMode:5 -- truncate in the middle
+	set my progressBar to ca's NSProgressIndicator's alloc()'s initWithFrame:{{0, 0}, {textWidth, 20}}
+	(my progressBar)'s setStyle:0 -- bar
+	(my progressBar)'s setIndeterminate:false
+	(my progressBar)'s setMinValue:0
+	(my progressBar)'s setMaxValue:1
+	(my progressBar)'s setDoubleValue:0
+
+	-- top to bottom: title, main text, bar, file name (AppKit's y axis goes up)
+	set container to ca's NSView's alloc()'s initWithFrame:{{0, 0}, {textWidth, 108}}
+	titleLabel's setFrameOrigin:{0, 84}
+	(my mainLabel)'s setFrameOrigin:{0, 56}
+	(my progressBar)'s setFrameOrigin:{0, 28}
+	(my detailLabel)'s setFrameOrigin:{0, 2}
+	repeat with v in {titleLabel, my mainLabel, my progressBar, my detailLabel}
+		container's addSubview:(contents of v)
+	end repeat
+
+	set theAlert to ca's NSAlert's alloc()'s init()
+	theAlert's setMessageText:""
+	theAlert's setInformativeText:""
+	set img to ca's NSImage's alloc()'s initWithContentsOfFile:iconPath
+	if img is not missing value then theAlert's setIcon:img
+	theAlert's setAccessoryView:container
+	set cancelButton to theAlert's addButtonWithTitle:"Cancel"
+	cancelButton's setKeyEquivalent:(character id 27)
+	theAlert's layout()
+	my tick:(missing value)
+	try
+		ca's NSApplication's sharedApplication()'s setActivationPolicy:1
+	end try
+	try
+		(theAlert's |window|())'s setLevel:3
+	end try
+	ca's NSApplication's sharedApplication()'s activateIgnoringOtherApps:true
+	set t to ca's NSTimer's timerWithTimeInterval:0.2 target:me selector:"tick:" userInfo:(missing value) repeats:true
+	(ca's NSRunLoop's currentRunLoop())'s addTimer:t forMode:(ca's NSModalPanelRunLoopMode)
+	set response to (theAlert's runModal()) as integer
+	t's invalidate()
+	-- Cancel (the work is still going on): tell the script
+	if response = 1000 then
+		(ca's NSString's stringWithString:"cancel")'s writeToFile:(my cancelPath) atomically:true encoding:4 |error|:(missing value)
+	end if
+end run
+
+on makeLabel(theText, theFont, theColor, textWidth, h)
+	set ca to current application
+	set field to ca's NSTextField's labelWithString:theText
+	field's setFont:theFont
+	field's setTextColor:theColor
+	field's setAlignment:(my centerValue)
+	field's setFrame:{{0, 0}, {textWidth, h}}
+	return field
+end makeLabel
+
+on progressExists()
+	return ((current application's NSFileManager's defaultManager()'s fileExistsAtPath:(my progressPath)) as boolean)
+end progressExists
+
+-- Every 0.2 s: read the progress file and update the window, or close it
+on tick:theTimer
+	set ca to current application
+	try
+		set s to ca's NSString's stringWithContentsOfFile:(my progressPath) encoding:4 |error|:(missing value)
+		if s is missing value then
+			if not (my progressExists()) then ca's NSApplication's sharedApplication()'s stopModalWithCode:2000
+			return
+		end if
+		set lns to paragraphs of (s as text)
+		if (count of lns) &lt; 1 then return
+		set nums to words of (item 1 of lns)
+		set doneCount to (item 1 of nums) as real
+		set total to (item 2 of nums) as real
+		if total &gt; 0 then
+			(my progressBar)'s stopAnimation:(missing value)
+			(my progressBar)'s setIndeterminate:false
+			(my progressBar)'s setMaxValue:total
+			(my progressBar)'s setDoubleValue:doneCount
+		else
+			-- total not known yet: a moving bar
+			(my progressBar)'s setIndeterminate:true
+			(my progressBar)'s startAnimation:(missing value)
+		end if
+		if (count of lns) &gt; 1 then (my mainLabel)'s setStringValue:(item 2 of lns)
+		if (count of lns) &gt; 2 then
+			(my detailLabel)'s setStringValue:(item 3 of lns)
+		else
+			(my detailLabel)'s setStringValue:""
+		end if
+	end try
+end tick:
+APPLESCRIPT
+
+progress_pid=""
+progress_start() {   # title
+  rm -f "$tmpdir/cancel"
+  print -r -- "0 0"$'\n'"Starting…" &gt; "$tmpdir/progress"
+  /usr/bin/osascript "$tmpdir/progress.applescript" "$1" "$tmpdir/progress" \
+    "$tmpdir/cancel" "$tmpdir/icon.png" &gt;/dev/null 2&gt;&amp;1 &amp;
+  progress_pid=$!
+}
+progress_set() {   # done total text [detail]
+  [[ -n $progress_pid ]] || return 0
+  print -r -- "$1 $2"$'\n'"$3"$'\n'"${4:-}" &gt; "$tmpdir/progress.tmp" \
+    &amp;&amp; mv -f "$tmpdir/progress.tmp" "$tmpdir/progress"
+}
+progress_stop() {
+  [[ -n $progress_pid ]] || return 0
+  rm -f "$tmpdir/progress"
+  # the window closes itself within 0.2 s once the file is gone
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 $progress_pid 2&gt;/dev/null || break
+    sleep 0.1
+  done
+  kill $progress_pid 2&gt;/dev/null
+  wait $progress_pid 2&gt;/dev/null
+  progress_pid=""
+}
+cancelled() { [[ -e $tmpdir/cancel ]] }
+
+# --- 1. Measure every file (several at a time) -------------------------------------
+# Each job writes "I TP LRA" (or "err") to $tmpdir/&lt;n&gt;.res
+measure() {   # n file
+  "$FFMPEG" -nostdin -hide_banner -nostats -i "$2" -map 0:a:0 \
+      -af ebur128=peak=true:framelog=quiet -f null - 2&gt;&amp;1 \
+    | awk '/Summary:/ { s = 1 }
+           s &amp;&amp; $1 == "I:"    { i = $2 }
+           s &amp;&amp; $1 == "LRA:"  { l = $2 }
+           s &amp;&amp; $1 == "Peak:" { p = $2 }
+           END { if (i == "") print "err"; else print i, p, l }' &gt; "$tmpdir/$1.res"
+}
+
+# Selected folders are searched with all their subfolders for audio files (WAV, AIFF,
+# CAF, FLAC, MP3, AAC/M4A, Ogg, Opus); every other file is ignored, and so are hidden
+# files. Files found in a folder are shown with their path in it.
+files=() labels=()
+add_folder() {   # folder
+  setopt localoptions extendedglob
+  local d=${1%/} g
+  for g in $d/**/*.(#i)(wav|aif|aiff|aifc|caf|flac|mp3|m4a|aac|ogg|opus)(N.n); do
+    files+=("$g"); labels+=("${g#$d/}")
+  done
+}
+for f in "$@"; do
+  if [[ -d $f ]]; then
+    add_folder "$f"
+  elif [[ -f $f ]]; then
+    files+=("$f"); labels+=("${f##*/}")
+  fi
+done
+if (( ${#files} == 0 )); then
+  /usr/bin/osascript -e 'display alert "No audio file found" message "Supported formats: WAV, AIFF, CAF, FLAC, MP3, AAC/M4A, Ogg and Opus." as critical' &gt;/dev/null 2&gt;&amp;1
+  exit 0
+fi
+
+maxjobs=$(/usr/sbin/sysctl -n hw.ncpu 2&gt;/dev/null)
+[[ $maxjobs == &lt;-&gt; ]] || maxjobs=4
+(( maxjobs &gt; 6 )) &amp;&amp; maxjobs=6
+progress_start "Analyze Loudness"
+pids=()
+for (( n = 1; n &lt;= ${#files}; n++ )); do
+  cancelled &amp;&amp; break
+  progress_set $(( n - 1 )) ${#files} "Analyzing $n of ${#files}" "${labels[n]}"
+  measure $n "${files[n]}" &amp;
+  pids+=($!)
+  if (( ${#pids} &gt;= maxjobs )); then wait ${pids[1]}; shift pids; fi
+done
+wait
+progress_stop
+cancelled &amp;&amp; exit 0
+
+# --- 2. Results ---------------------------------------------------------------------
+# Gain each platform applies to a track (track mode). "up" platforms turn quiet
+# tracks up only while the true peak stays at or below -1 dBTP; "down" platforms
+# never turn up; "limiter" reaches the target in any case (Spotify Loud);
+# "exact" is a delivery target (broadcast).
+platforms=(
+  "Spotify Normal:-14:up"
+  "Spotify Loud:-11:limiter"
+  "Spotify Quiet:-19:up"
+  "YouTube:-14:down"
+  "Apple Music:-16:down"
+  "Tidal:-14:up"
+  "Amazon Music:-14:up"
+  "Deezer:-15:up"
+  "SoundCloud:-14:down"
+  "Broadcast EBU R128:-23:exact"
+)
+
+specs=()     # one entry per file, lines: name / loudness / true peak / menu items
+plain=""     # same results as plain text, for "Copy Results"
+for (( n = 1; n &lt;= ${#files}; n++ )); do
+  name=${labels[n]}
+  r=""
+  [[ -f $tmpdir/$n.res ]] &amp;&amp; r=$(&lt;"$tmpdir/$n.res")
+  if [[ -z $r || $r == err ]]; then
+    specs+=("${name}"$'\n'"!Not an audio file, or unreadable")
+    plain+="${name}"$'\n'"Not an audio file, or unreadable"$'\n\n'
+    continue
+  fi
+  out=$(print -r -- "$r" | awk -v plats="${(j:|:)platforms}" '
+    function fmt(g) { if (g &gt; -0.05 &amp;&amp; g &lt; 0.05) return "0.0 dB"; return sprintf("%+.1f dB", g) }
+    { i = $1; tp = $2 }
+    END {
+      if (i &lt;= -70) { print "silent"; exit }
+      printf "%.1f LUFS\n%+.1f dBTP\n", i, tp
+      np = split(plats, P, "|")
+      for (k = 1; k &lt;= np; k++) {
+        split(P[k], f, ":"); label = f[1]; t = f[2] + 0; mode = f[3]
+        g = t - i; note = ""
+        if (g &gt; 0) {
+          if (mode == "down") { g = 0; note = " (not turned up)" }
+          else if (mode == "up") {
+            room = -1 - tp; if (room &lt; 0) room = 0
+            if (g &gt; room) { g = room; note = " (limited by true peak)" }
+          }
+          else if (mode == "limiter" &amp;&amp; tp + g &gt; -1) note = " (limiter)"
+        }
+        printf "%s %d LUFS: %s%s\n", label, t, fmt(g), note
+      }
+    }')
+  if [[ $out == silent ]]; then
+    specs+=("${name}"$'\n'"!Silent (below -70 LUFS)")
+    plain+="${name}"$'\n'"Silent (below -70 LUFS)"$'\n\n'
+    continue
+  fi
+  specs+=("${name}"$'\n'"${out}")
+  lines=("${(@f)out}")
+  plain+="${name}"$'\n'"Loudness: ${lines[1]}"$'\n'"True peak: ${lines[2]}"$'\n'
+  plain+="${lines[3]}"$'\n'      # default platform (Spotify Normal -14 LUFS)
+  plain+=$'\n'
+done
+while [[ $plain == *$'\n' ]]; do plain=${plain%$'\n'}; done   # no trailing blank lines
+
+# --- 3. Window -------------------------------------------------------------------------
+
 cat &gt; "$tmpdir/results.applescript" &lt;&lt;'APPLESCRIPT'
 use AppleScript version "2.4"
 use framework "Foundation"
@@ -1899,7 +2088,7 @@ exit 0
 			<string>/System/Library/CoreServices/Finder.app</string>
 		</array>
 		<key>inputTypeIdentifier</key>
-		<string>com.apple.Automator.fileSystemObject.music</string>
+		<string>com.apple.Automator.fileSystemObject</string>
 		<key>outputTypeIdentifier</key>
 		<string>com.apple.Automator.nothing</string>
 		<key>presentationMode</key>
@@ -1911,7 +2100,7 @@ exit 0
 		<key>serviceApplicationPath</key>
 		<string>/System/Library/CoreServices/Finder.app</string>
 		<key>serviceInputTypeIdentifier</key>
-		<string>com.apple.Automator.fileSystemObject.music</string>
+		<string>com.apple.Automator.fileSystemObject</string>
 		<key>serviceOutputTypeIdentifier</key>
 		<string>com.apple.Automator.nothing</string>
 		<key>serviceProcessesInput</key>

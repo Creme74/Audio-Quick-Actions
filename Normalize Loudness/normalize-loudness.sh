@@ -13,6 +13,9 @@
 #   below the ceiling below), so they may end up under the target.
 # - Lossless formats only: WAV, AIFF/AIF/AIFC, CAF (uncompressed PCM) and FLAC.
 #   Other files are measured and shown, but not modified.
+# - Works on files and on folders: a folder is searched with all its subfolders, for
+#   WAV, AIFF, CAF and FLAC files (hidden files and "Normalized" folders are ignored).
+# - Progress windows show the files being measured, then normalized; Cancel stops.
 # - File type, bit depth (8/16/24/32-bit, integer or float) and sample rate are kept.
 # - WAV / AIFF / CAF: the result is a byte-for-byte copy of the original in which only
 #   the audio samples are replaced, so Apple Loops metadata (tempo, key, tags,
@@ -51,7 +54,7 @@ for p in /opt/homebrew/bin/ffmpeg /usr/local/bin/ffmpeg; do
 done
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/loudnorm.XXXXXX") || exit 1
-trap 'rm -rf "$tmpdir"' EXIT
+trap '[[ -n $progress_pid ]] && kill $progress_pid 2>/dev/null; rm -rf "$tmpdir"' EXIT
 pl="$tmpdir/afmeta.pl"
 
 # --- File structure helper -------------------------------------------------------
@@ -347,117 +350,7 @@ maxjobs=$(/usr/sbin/sysctl -n hw.ncpu 2>/dev/null)
 (( maxjobs > 6 )) && maxjobs=6
 (( maxjobs < 1 )) && maxjobs=1
 
-# --- 1. Scan (headers only) and measure every file ----------------------------------
-files=() infos=()
-for f in "$@"; do [[ -f $f ]] && files+=("$f"); done
-(( ${#files} )) || exit 0
-infos=("${(@f)$(/usr/bin/perl "$pl" scan "${files[@]}")}")
-
-pids=()
-for (( n = 1; n <= ${#files}; n++ )); do
-  measure $n "${files[n]}" &
-  pids+=($!)
-  if (( ${#pids} >= maxjobs )); then wait ${pids[1]}; shift pids; fi
-done
-wait
-
-# --- 2. Gain needed for each target ----------------------------------------------
-# Plain gain: loud files are turned down to the target; quiet files are turned up
-# only while the true peak stays at or below the ceiling.
-# Input: "I TP LRA". Output: loudness, true peak, then one line per target in tl
-# ("Name:LUFS|..."): "<gain> <limited 0/1><TAB><text shown in the window>".
-gain_awk='
-    { i = $1; tp = $2 }
-    END {
-      if (i <= -70) { print "silent"; exit }
-      printf "%.1f LUFS\n%+.1f dBTP\n", i, tp
-      nt = split(tl, T, "|")
-      for (k = 1; k <= nt; k++) {
-        split(T[k], f, ":"); t = f[2] + 0
-        g = t - i; lim = 0
-        if (g > 0) {
-          room = ceil - tp; if (room < 0) room = 0
-          if (g > room + 0.001) { g = room; lim = 1 }
-        }
-        if (g > -0.05 && g < 0.05) {
-          g = 0
-          text = lim ? "Gain: 0.0 dB (limited by true peak)" : "Gain: 0.0 dB (already at target)"
-        } else {
-          text = sprintf("Gain: %+.1f dB → %.1f LUFS%s", g, i + g, lim ? " (limited by true peak)" : "")
-        }
-        printf "%.1f %d\t%s\n", g, lim, text
-      }
-    }'
-typeset -A gains limited
-specs=()          # one entry per file, lines: name / loudness / true peak / one line per target
-plains=()         # plain-text results, one entry per target (fallback dialog)
-titles=()
-for t in "${targets[@]}"; do titles+=("${t%%:*} ${t##*:} LUFS"); done
-todo=()           # files that can be normalized
-notes=""          # files that will not be modified, with the reason
-skipcount=0       # files measured and shown, but not modified
-for (( n = 1; n <= ${#files}; n++ )); do
-  name=${files[n]##*/}
-  r=""
-  [[ -f $tmpdir/m$n.res ]] && r=$(<"$tmpdir/m$n.res")
-  if [[ -z $r || $r == err ]]; then
-    specs+=("${name}"$'\n'"!Not an audio file, or unreadable")
-    notes+="${name}: not an audio file, or unreadable"$'\n'
-    for (( p = 1; p <= ${#targets}; p++ )); do plains[p]+="${name}"$'\n'"Not an audio file, or unreadable"$'\n\n'; done
-    continue
-  fi
-  case ${infos[n]} in
-    pcm\ *|flac\ *) why="" ;;
-    compressed)     why="compressed audio" ;;
-    unreadable)     why="unreadable file structure" ;;
-    *)              why="not a WAV, AIFF, CAF or FLAC file" ;;
-  esac
-  out=$(print -r -- "$r" | awk -v tl="${(j:|:)targets}" -v ceil="$ceiling" "$gain_awk")
-  if [[ $out == silent ]]; then
-    specs+=("${name}"$'\n'"!Silent (below -70 LUFS)")
-    notes+="${name}: silent (below -70 LUFS)"$'\n'
-    for (( p = 1; p <= ${#targets}; p++ )); do plains[p]+="${name}"$'\n'"Silent (below -70 LUFS)"$'\n\n'; done
-    continue
-  fi
-  lines=("${(@f)out}")
-  spec="${name}"$'\n'"${lines[1]}"$'\n'"${lines[2]}"
-  for (( p = 1; p <= ${#targets}; p++ )); do
-    l=${lines[p + 2]}
-    vals=(${=l%%$'\t'*})
-    gains[$n,$p]=${vals[1]}
-    limited[$n,$p]=${vals[2]}
-    shown=${l#*$'\t'}
-    [[ -n $why ]] && shown="Not modified (${why})"
-    spec+=$'\n'"${shown}"
-    plains[p]+="${name}"$'\n'"Loudness: ${lines[1]}"$'\n'"True peak: ${lines[2]}"$'\n'"${shown}"$'\n\n'
-  done
-  specs+=("$spec")
-  if [[ -n $why ]]; then
-    (( skipcount++ ))
-    notes+="${name}: ${why}"$'\n'
-  else
-    todo+=($n)
-  fi
-done
-
-if (( ${#todo} == 0 )); then
-  alert "No file can be normalized" \
-    "Supported formats: WAV, AIFF, CAF (uncompressed) and FLAC."$'\n\n'"${notes}"
-  exit 0
-fi
-
-# --- 3. Window: results, target, Overwrite / Duplicate ------------------------------
-if (( ${#todo} == 1 )); then
-  over_text="Overwrite: replace the original file. This cannot be undone."
-  dup_text="Duplicate: create a normalized copy in a “${copydir}” subfolder, next to the original."
-else
-  over_text="Overwrite: replace the original files. This cannot be undone."
-  dup_text="Duplicate: create normalized copies in a “${copydir}” subfolder, next to the originals."
-fi
-for (( p = 1; p <= ${#targets}; p++ )); do
-  while [[ ${plains[p]} == *$'\n' ]]; do plains[p]=${plains[p]%$'\n'}; done
-done
-
+# Logo shown in the windows (PNG, base64)
 /usr/bin/base64 --decode > "$tmpdir/icon.png" 2>/dev/null <<'ICON'
 iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAEAAElEQVR42uy9d5hkV3H+/znnps49
 3ZNnNmdtUM5IQggUABEMSASbYIwTJgf764QkLIxtwIDBgAkGbEwQIiogIYRyDrta7WpznJ2dPNO5
@@ -1673,6 +1566,308 @@ i4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uL
 i4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLy3uW/xelrsbi0etWdgAAAABJ
 RU5ErkJggg==
 ICON
+# --- Progress window --------------------------------------------------------------------
+# While the files are analyzed or processed, a small window shows a progress bar, the
+# file being worked on, and a Cancel button. It only appears when the work lasts more
+# than a moment.
+#   progress_start TITLE         opens it (in the background)
+#   progress_set DONE TOTAL TEXT [DETAIL]
+#   progress_stop                closes it
+#   cancelled                    true once Cancel was clicked
+cat > "$tmpdir/progress.applescript" <<'APPLESCRIPT'
+use AppleScript version "2.4"
+use framework "Foundation"
+use framework "AppKit"
+use scripting additions
+
+property progressPath : ""
+property cancelPath : ""
+property progressBar : missing value
+property mainLabel : missing value
+property detailLabel : missing value
+property centerValue : 1
+
+-- Arguments: title, progress file, cancel file, icon.
+-- The progress file holds three lines: "DONE TOTAL", the main text, the detail (a
+-- file name). With a TOTAL of 0 the bar just moves (amount not known yet). The window
+-- closes when the file is gone; Cancel creates the cancel file.
+on run argv
+	set ca to current application
+	set titleText to item 1 of argv
+	set my progressPath to item 2 of argv
+	set my cancelPath to item 3 of argv
+	set iconPath to item 4 of argv
+	-- short work: no window at all
+	delay 0.6
+	if not (my progressExists()) then return
+	if (do shell script "/usr/bin/uname -m") is "x86_64" then set my centerValue to 2
+	set textWidth to 360
+	set redColor to ca's NSColor's colorWithSRGBRed:0.94 green:0.58 blue:0.47 alpha:1.0
+	set yellowColor to ca's NSColor's colorWithSRGBRed:0.78 green:0.72 blue:0.48 alpha:0.85
+
+	set titleLabel to my makeLabel(titleText, ca's NSFont's boldSystemFontOfSize:18, redColor, textWidth, 24)
+	set my mainLabel to my makeLabel("Starting" & (character id 8230), ca's NSFont's boldSystemFontOfSize:14, ca's NSColor's labelColor(), textWidth, 20)
+	set my detailLabel to my makeLabel("", ca's NSFont's systemFontOfSize:12, yellowColor, textWidth, 18)
+	(my detailLabel)'s setLineBreakMode:5 -- truncate in the middle
+	set my progressBar to ca's NSProgressIndicator's alloc()'s initWithFrame:{{0, 0}, {textWidth, 20}}
+	(my progressBar)'s setStyle:0 -- bar
+	(my progressBar)'s setIndeterminate:false
+	(my progressBar)'s setMinValue:0
+	(my progressBar)'s setMaxValue:1
+	(my progressBar)'s setDoubleValue:0
+
+	-- top to bottom: title, main text, bar, file name (AppKit's y axis goes up)
+	set container to ca's NSView's alloc()'s initWithFrame:{{0, 0}, {textWidth, 108}}
+	titleLabel's setFrameOrigin:{0, 84}
+	(my mainLabel)'s setFrameOrigin:{0, 56}
+	(my progressBar)'s setFrameOrigin:{0, 28}
+	(my detailLabel)'s setFrameOrigin:{0, 2}
+	repeat with v in {titleLabel, my mainLabel, my progressBar, my detailLabel}
+		container's addSubview:(contents of v)
+	end repeat
+
+	set theAlert to ca's NSAlert's alloc()'s init()
+	theAlert's setMessageText:""
+	theAlert's setInformativeText:""
+	set img to ca's NSImage's alloc()'s initWithContentsOfFile:iconPath
+	if img is not missing value then theAlert's setIcon:img
+	theAlert's setAccessoryView:container
+	set cancelButton to theAlert's addButtonWithTitle:"Cancel"
+	cancelButton's setKeyEquivalent:(character id 27)
+	theAlert's layout()
+	my tick:(missing value)
+	try
+		ca's NSApplication's sharedApplication()'s setActivationPolicy:1
+	end try
+	try
+		(theAlert's |window|())'s setLevel:3
+	end try
+	ca's NSApplication's sharedApplication()'s activateIgnoringOtherApps:true
+	set t to ca's NSTimer's timerWithTimeInterval:0.2 target:me selector:"tick:" userInfo:(missing value) repeats:true
+	(ca's NSRunLoop's currentRunLoop())'s addTimer:t forMode:(ca's NSModalPanelRunLoopMode)
+	set response to (theAlert's runModal()) as integer
+	t's invalidate()
+	-- Cancel (the work is still going on): tell the script
+	if response = 1000 then
+		(ca's NSString's stringWithString:"cancel")'s writeToFile:(my cancelPath) atomically:true encoding:4 |error|:(missing value)
+	end if
+end run
+
+on makeLabel(theText, theFont, theColor, textWidth, h)
+	set ca to current application
+	set field to ca's NSTextField's labelWithString:theText
+	field's setFont:theFont
+	field's setTextColor:theColor
+	field's setAlignment:(my centerValue)
+	field's setFrame:{{0, 0}, {textWidth, h}}
+	return field
+end makeLabel
+
+on progressExists()
+	return ((current application's NSFileManager's defaultManager()'s fileExistsAtPath:(my progressPath)) as boolean)
+end progressExists
+
+-- Every 0.2 s: read the progress file and update the window, or close it
+on tick:theTimer
+	set ca to current application
+	try
+		set s to ca's NSString's stringWithContentsOfFile:(my progressPath) encoding:4 |error|:(missing value)
+		if s is missing value then
+			if not (my progressExists()) then ca's NSApplication's sharedApplication()'s stopModalWithCode:2000
+			return
+		end if
+		set lns to paragraphs of (s as text)
+		if (count of lns) < 1 then return
+		set nums to words of (item 1 of lns)
+		set doneCount to (item 1 of nums) as real
+		set total to (item 2 of nums) as real
+		if total > 0 then
+			(my progressBar)'s stopAnimation:(missing value)
+			(my progressBar)'s setIndeterminate:false
+			(my progressBar)'s setMaxValue:total
+			(my progressBar)'s setDoubleValue:doneCount
+		else
+			-- total not known yet: a moving bar
+			(my progressBar)'s setIndeterminate:true
+			(my progressBar)'s startAnimation:(missing value)
+		end if
+		if (count of lns) > 1 then (my mainLabel)'s setStringValue:(item 2 of lns)
+		if (count of lns) > 2 then
+			(my detailLabel)'s setStringValue:(item 3 of lns)
+		else
+			(my detailLabel)'s setStringValue:""
+		end if
+	end try
+end tick:
+APPLESCRIPT
+
+progress_pid=""
+progress_start() {   # title
+  rm -f "$tmpdir/cancel"
+  print -r -- "0 0"$'\n'"Starting…" > "$tmpdir/progress"
+  /usr/bin/osascript "$tmpdir/progress.applescript" "$1" "$tmpdir/progress" \
+    "$tmpdir/cancel" "$tmpdir/icon.png" >/dev/null 2>&1 &
+  progress_pid=$!
+}
+progress_set() {   # done total text [detail]
+  [[ -n $progress_pid ]] || return 0
+  print -r -- "$1 $2"$'\n'"$3"$'\n'"${4:-}" > "$tmpdir/progress.tmp" \
+    && mv -f "$tmpdir/progress.tmp" "$tmpdir/progress"
+}
+progress_stop() {
+  [[ -n $progress_pid ]] || return 0
+  rm -f "$tmpdir/progress"
+  # the window closes itself within 0.2 s once the file is gone
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 $progress_pid 2>/dev/null || break
+    sleep 0.1
+  done
+  kill $progress_pid 2>/dev/null
+  wait $progress_pid 2>/dev/null
+  progress_pid=""
+}
+cancelled() { [[ -e $tmpdir/cancel ]] }
+
+# --- 1. Scan (headers only) and measure every file ----------------------------------
+# Selected folders are searched with all their subfolders, for WAV, AIFF, CAF and
+# FLAC files only; every other file is ignored, and so are hidden files and the
+# folders made by Duplicate. Files found in a folder are shown with their path in it.
+files=() labels=() infos=()
+add_folder() {   # folder
+  setopt localoptions extendedglob
+  local d=${1%/} g
+  for g in $d/**/*.(#i)(wav|aif|aiff|aifc|caf|flac)(N.n); do
+    [[ ${g#$d/} == (*/|)${copydir}/* ]] && continue
+    files+=("$g"); labels+=("${g#$d/}")
+  done
+}
+for f in "$@"; do
+  if [[ -d $f ]]; then
+    add_folder "$f"
+  elif [[ -f $f ]]; then
+    files+=("$f"); labels+=("${f##*/}")
+  fi
+done
+if (( ${#files} == 0 )); then
+  alert "No audio file found" "Supported formats: WAV, AIFF, CAF (uncompressed) and FLAC."
+  exit 0
+fi
+# headers are read 200 files at a time (long argument lists)
+for (( i = 1; i <= ${#files}; i += 200 )); do
+  infos+=("${(@f)$(/usr/bin/perl "$pl" scan "${(@)files[i,i+199]}")}")
+done
+
+progress_start "Normalize Loudness"
+pids=()
+for (( n = 1; n <= ${#files}; n++ )); do
+  cancelled && break
+  progress_set $(( n - 1 )) ${#files} "Analyzing $n of ${#files}" "${labels[n]}"
+  measure $n "${files[n]}" &
+  pids+=($!)
+  if (( ${#pids} >= maxjobs )); then wait ${pids[1]}; shift pids; fi
+done
+wait
+progress_stop
+cancelled && exit 0
+
+# --- 2. Gain needed for each target ----------------------------------------------
+# Plain gain: loud files are turned down to the target; quiet files are turned up
+# only while the true peak stays at or below the ceiling.
+# Input: "I TP LRA". Output: loudness, true peak, then one line per target in tl
+# ("Name:LUFS|..."): "<gain> <limited 0/1><TAB><text shown in the window>".
+gain_awk='
+    { i = $1; tp = $2 }
+    END {
+      if (i <= -70) { print "silent"; exit }
+      printf "%.1f LUFS\n%+.1f dBTP\n", i, tp
+      nt = split(tl, T, "|")
+      for (k = 1; k <= nt; k++) {
+        split(T[k], f, ":"); t = f[2] + 0
+        g = t - i; lim = 0
+        if (g > 0) {
+          room = ceil - tp; if (room < 0) room = 0
+          if (g > room + 0.001) { g = room; lim = 1 }
+        }
+        if (g > -0.05 && g < 0.05) {
+          g = 0
+          text = lim ? "Gain: 0.0 dB (limited by true peak)" : "Gain: 0.0 dB (already at target)"
+        } else {
+          text = sprintf("Gain: %+.1f dB → %.1f LUFS%s", g, i + g, lim ? " (limited by true peak)" : "")
+        }
+        printf "%.1f %d\t%s\n", g, lim, text
+      }
+    }'
+typeset -A gains limited
+specs=()          # one entry per file, lines: name / loudness / true peak / one line per target
+plains=()         # plain-text results, one entry per target (fallback dialog)
+titles=()
+for t in "${targets[@]}"; do titles+=("${t%%:*} ${t##*:} LUFS"); done
+todo=()           # files that can be normalized
+notes=""          # files that will not be modified, with the reason
+skipcount=0       # files measured and shown, but not modified
+for (( n = 1; n <= ${#files}; n++ )); do
+  name=${labels[n]}
+  r=""
+  [[ -f $tmpdir/m$n.res ]] && r=$(<"$tmpdir/m$n.res")
+  if [[ -z $r || $r == err ]]; then
+    specs+=("${name}"$'\n'"!Not an audio file, or unreadable")
+    notes+="${name}: not an audio file, or unreadable"$'\n'
+    for (( p = 1; p <= ${#targets}; p++ )); do plains[p]+="${name}"$'\n'"Not an audio file, or unreadable"$'\n\n'; done
+    continue
+  fi
+  case ${infos[n]} in
+    pcm\ *|flac\ *) why="" ;;
+    compressed)     why="compressed audio" ;;
+    unreadable)     why="unreadable file structure" ;;
+    *)              why="not a WAV, AIFF, CAF or FLAC file" ;;
+  esac
+  out=$(print -r -- "$r" | awk -v tl="${(j:|:)targets}" -v ceil="$ceiling" "$gain_awk")
+  if [[ $out == silent ]]; then
+    specs+=("${name}"$'\n'"!Silent (below -70 LUFS)")
+    notes+="${name}: silent (below -70 LUFS)"$'\n'
+    for (( p = 1; p <= ${#targets}; p++ )); do plains[p]+="${name}"$'\n'"Silent (below -70 LUFS)"$'\n\n'; done
+    continue
+  fi
+  lines=("${(@f)out}")
+  spec="${name}"$'\n'"${lines[1]}"$'\n'"${lines[2]}"
+  for (( p = 1; p <= ${#targets}; p++ )); do
+    l=${lines[p + 2]}
+    vals=(${=l%%$'\t'*})
+    gains[$n,$p]=${vals[1]}
+    limited[$n,$p]=${vals[2]}
+    shown=${l#*$'\t'}
+    [[ -n $why ]] && shown="Not modified (${why})"
+    spec+=$'\n'"${shown}"
+    plains[p]+="${name}"$'\n'"Loudness: ${lines[1]}"$'\n'"True peak: ${lines[2]}"$'\n'"${shown}"$'\n\n'
+  done
+  specs+=("$spec")
+  if [[ -n $why ]]; then
+    (( skipcount++ ))
+    notes+="${name}: ${why}"$'\n'
+  else
+    todo+=($n)
+  fi
+done
+
+if (( ${#todo} == 0 )); then
+  alert "No file can be normalized" \
+    "Supported formats: WAV, AIFF, CAF (uncompressed) and FLAC."$'\n\n'"${notes}"
+  exit 0
+fi
+
+# --- 3. Window: results, target, Overwrite / Duplicate ------------------------------
+if (( ${#todo} == 1 )); then
+  over_text="Overwrite: replace the original file. This cannot be undone."
+  dup_text="Duplicate: create a normalized copy in a “${copydir}” subfolder, next to the original."
+else
+  over_text="Overwrite: replace the original files. This cannot be undone."
+  dup_text="Duplicate: create normalized copies in a “${copydir}” subfolder, next to the originals."
+fi
+for (( p = 1; p <= ${#targets}; p++ )); do
+  while [[ ${plains[p]} == *$'\n' ]]; do plains[p]=${plains[p]%$'\n'}; done
+done
+
 
 # The window is a native alert, so that the text can use colors and bold:
 # AppleLoopEditor's coral red (logoRed) and vintage yellow (vintageYellow).
@@ -2291,8 +2486,12 @@ else
 fi
 
 # --- 4. Normalize, several files at a time ---------------------------------------
-pids=()
+progress_start "Normalize Loudness"
+pids=() i=0
 for n in "${todo[@]}"; do
+  cancelled && break
+  (( i++ ))
+  progress_set $(( i - 1 )) ${#todo} "Normalizing $i of ${#todo}" "${labels[n]}"
   f=${files[n]}
   name=${f##*/}
   dir=${f%/*}; [[ -n $dir ]] || dir=/
@@ -2324,7 +2523,9 @@ for n in "${todo[@]}"; do
     shift pids
   fi
 done
+# files already started are finished even after Cancel: none is left half written
 wait
+progress_stop
 
 # --- 5. Summary ------------------------------------------------------------------
 count=0 unchanged=0 capped=0
@@ -2335,8 +2536,8 @@ for n in "${todo[@]}"; do
   case $r in
     ok)     (( count++ )); [[ ${limited[$n,$choice]} == 1 ]] && (( capped++ )) ;;
     same)   (( unchanged++ )) ;;
-    err\ *) errors+="${files[n]##*/}: ${r#err }"$'\n' ;;
-    *)      errors+="${files[n]##*/}: unknown error"$'\n' ;;
+    err\ *) errors+="${labels[n]}: ${r#err }"$'\n' ;;
+    *)      cancelled || errors+="${labels[n]}: unknown error"$'\n' ;;
   esac
 done
 
@@ -2354,6 +2555,7 @@ if (( unchanged > 0 )); then
   fi
 fi
 [[ -n $summary ]] || summary="No file normalized"
+cancelled && summary+=" (cancelled)"
 [[ $mode == duplicate ]] && (( count + unchanged > 0 )) && summary+=" → “${copydir}” folder"
 
 # The files that could not be modified were already listed in the window: a window

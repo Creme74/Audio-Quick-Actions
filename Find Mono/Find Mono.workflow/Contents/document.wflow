@@ -74,6 +74,8 @@
 # - Works on files and on folders: a folder is searched with all its subfolders,
 #   and only its WAV, AIFF, CAF and FLAC files are analyzed (every other file is
 #   ignored, and so are hidden files and the "Mono" folders made by Duplicate).
+# - A progress window with a Cancel button shows while the files are analyzed and
+#   while they are converted.
 # - Several files (or a folder) selected: only the files with something to do are
 #   listed (with the number of stereo and mono files found).
 # - Overwrite the originals, or duplicate them into a "Mono" subfolder.
@@ -102,7 +104,7 @@ done
 FFPROBE=${FFMPEG%/*}/ffprobe
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/findmono.XXXXXX") || exit 1
-trap 'rm -rf "$tmpdir"' EXIT
+trap '[[ -n $progress_pid ]] &amp;&amp; kill $progress_pid 2&gt;/dev/null; rm -rf "$tmpdir"' EXIT
 pl="$tmpdir/afmeta.pl"
 
 # --- File structure helper -------------------------------------------------------
@@ -559,172 +561,6 @@ maxjobs=$(/usr/sbin/sysctl -n hw.ncpu 2&gt;/dev/null)
 [[ $maxjobs == &lt;-&gt; ]] || maxjobs=4
 (( maxjobs &gt; 6 )) &amp;&amp; maxjobs=6
 (( maxjobs &lt; 1 )) &amp;&amp; maxjobs=1
-
-# --- 1. Scan (headers only) and analyze every file -----------------------------------
-# Selected folders are searched with all their subfolders, for WAV, AIFF, CAF and
-# FLAC files only; every other file is ignored, and so are hidden files (such as
-# the "._" files macOS writes on external drives) and the "Mono" folders made by
-# Duplicate. Files found in a folder are shown with their path inside it.
-files=() labels=() infos=() folders=0
-add_folder() {   # folder
-  setopt localoptions extendedglob
-  local d=${1%/} g
-  for g in $d/**/*.(#i)(wav|aif|aiff|aifc|caf|flac)(N.n); do
-    [[ ${g#$d/} == (*/|)${copydir}/* ]] &amp;&amp; continue
-    files+=("$g"); labels+=("${g#$d/}")
-  done
-}
-for f in "$@"; do
-  if [[ -d $f ]]; then
-    (( folders++ )); add_folder "$f"
-  elif [[ -f $f ]]; then
-    files+=("$f"); labels+=("${f##*/}")
-  fi
-done
-if (( ${#files} == 0 )); then
-  if (( folders == 1 )); then
-    alert "No lossless audio file found" "There is no WAV, AIFF, CAF or FLAC file in the selected folder."
-  elif (( folders &gt; 1 )); then
-    alert "No lossless audio file found" "There is no WAV, AIFF, CAF or FLAC file in the selected folders."
-  fi
-  exit 0
-fi
-# headers are read 200 files at a time (long argument lists)
-for (( i = 1; i &lt;= ${#files}; i += 200 )); do
-  infos+=("${(@f)$(/usr/bin/perl "$pl" scan "${(@)files[i,i+199]}")}")
-done
-
-if [[ ${(M)infos:#(pcm|flac) *} == "" ]]; then
-  alert "No lossless audio file selected" "Find Mono works on WAV, AIFF, CAF and FLAC files."
-  exit 0
-fi
-
-pids=()
-for (( n = 1; n &lt;= ${#files}; n++ )); do
-  [[ ${infos[n]} == (pcm|flac)\ * ]] || continue
-  analyze $n "${files[n]}" &amp;
-  pids+=($!)
-  if (( ${#pids} &gt;= maxjobs )); then wait ${pids[1]}; shift pids; fi
-done
-wait
-
-# --- 2. Results --------------------------------------------------------------------
-# kind: "fake" (converted), "opt" (converted if its box is ticked), "info" (shown
-# only) or "err"
-specs=()          # one entry per file shown
-spec_file=()      # file number of each entry (0: skipped / unreadable)
-todo=()           # fake stereo files: always converted
-keep=()           # channel kept for each file: 0 = left, 1 = right
-nopt=0         # files with a "Convert to mono" box
-# Several files selected: only the files with something to do are listed
-batch=$(( ${#files} &gt; 1 || folders &gt; 0 ))
-n_mono=0 n_stereo=0 n_other=0 n_lossy=0   # files left out of the list
-for (( n = 1; n &lt;= ${#files}; n++ )); do
-  name=${labels[n]}
-  r=""
-  [[ -f $tmpdir/a$n.res ]] &amp;&amp; r=$(&lt;"$tmpdir/a$n.res")
-  info=(${=infos[n]})
-  case ${info[1]} in
-    pcm)  bits=${info[3]}; [[ ${info[2]} == floating-point ]] &amp;&amp; bits=24 ;;
-    flac) bits=${info[2]} ;;
-    compressed) (( batch )) &amp;&amp; { (( n_lossy++ )); continue }
-                specs+=("${name}"$'\n'"!Skipped (compressed audio)"); spec_file+=(0); continue ;;
-    *)    (( batch )) &amp;&amp; { (( n_lossy++ )); continue }
-          specs+=("${name}"$'\n'"!Skipped (not a WAV, AIFF, CAF or FLAC file)"); spec_file+=(0); continue ;;
-  esac
-  # Fake stereo: both channels identical, or differing only by dither noise (a few
-  # steps of the file's resolution). Panned or inverted mono is reported, not
-  # converted. The correlation of the channels comes from the RMS levels:
-  # sum(L.R) = (rms(L+R)^2 - rms(L-R)^2) / 4.
-  out=$(print -r -- "$r" | awk -v bits="$bits" -v steps="$dither_steps" '
-    function db(x) { return x == "-inf" ? -1000 : x + 0 }
-    function lin(x) { return x &lt;= -1000 ? 0 : 10 ^ (x / 20) }
-    function abs(x) { return x &lt; 0 ? -x : x }
-    $1 == "ch" {
-      if ($2 == 1) print "info\tMono\tAlready a mono file"
-      else         print "info\t" $2 " channels\tNot a stereo file"
-      exit
-    }
-    $1 == "st" {
-      keepl = "Convert to mono (keep the left channel"; keepr = "Convert to mono (keep the right channel"
-      l = db($2); r = db($3); d = db($4); s = db($5)
-      thr = 20 * log(steps / 2 ^ (bits - 1)) / log(10); if (thr &gt; -60) thr = -60
-      if (l &lt;= -1000 &amp;&amp; r &lt;= -1000) { print "info\tSilent\tBoth channels are silent"; exit }
-      if (d &lt;= -1000) { print "fake\t100% Mono\tMono file disguised as a stereo file\t\t0"; exit }
-      if (d &lt;= thr) { print "fake\t100% Mono\tMono file disguised as a stereo file, apart from an inaudible dither noise\t\t0"; exit }
-      if (s &lt;= thr) { print "opt\tFake Mono\tMono signal, one channel with inverted polarity\t" keepl ")\t0"; exit }
-      if (r &lt;= -1000) { print "opt\tLeft channel only\tThe right channel is silent\t" keepl ")\t0"; exit }
-      if (l &lt;= -1000) { print "opt\tRight channel only\tThe left channel is silent\t" keepr ")\t1"; exit }
-      rl = lin($6); rr = lin($7); rd = lin($8); rs = lin($9)
-      rho = (rl &gt; 0 &amp;&amp; rr &gt; 0) ? (rs * rs - rd * rd) / (4 * rl * rr) : 0
-      res = 1 - rho * rho; if (res &lt; 1e-30) res = 1e-30
-      bal = db($6) - db($7)
-      below = (db($6) &gt; db($7) ? db($6) : db($7)) - db($8)   # difference vs. signal (RMS)
-      # 99.9% Mono: the difference stays at least 40 dB under the signal (1% in level)
-      if (10 * log(res) / log(10) &lt;= -50) {
-        if (rho &lt; 0) print "opt\tFake Mono\tMono signal, one channel with inverted polarity\t" keepl ")\t0"
-        else if (abs(bal) &gt;= 0.1)
-          printf "opt\tFake Mono\tMono signal panned to the %s (the %s channel is %.1f dB louder)\t%s\t%d\n", (bal &gt; 0 ? "left" : "right"), (bal &gt; 0 ? "left" : "right"), abs(bal), (bal &gt; 0 ? keepl ", the louder one)" : keepr ", the louder one)"), (bal &gt; 0 ? 0 : 1)
-        else printf "opt\t99.9%% Mono\tPractically mono: the difference between the channels is %.0f dB below the signal\t%s)\t0\n", below, keepl
-        exit
-      }
-      if (below &gt;= 40) { printf "opt\t99.9%% Mono\tPractically mono: the difference between the channels is %.0f dB below the signal\t%s)\t0\n", below, keepl; exit }
-      print "info\tReal stereo\t"
-      exit
-    }
-    { print "err" }')
-  if [[ -z $out || $out == err ]]; then
-    specs+=("${name}"$'\n'"!Not an audio file, or unreadable"); spec_file+=(0)
-    continue
-  fi
-  fld=("${(@ps:\t:)out}")
-  # Several files: mono, real stereo, silent or multichannel files are left out
-  if (( batch )) &amp;&amp; [[ ${fld[1]} == info ]]; then
-    case ${fld[2]} in
-      Mono)          (( n_mono++ )) ;;
-      "Real stereo") (( n_stereo++ )) ;;
-      *)             (( n_other++ )) ;;
-    esac
-    continue
-  fi
-  # lines: name / result (framed) / detail / checkbox title (optional conversion)
-  specs+=("${name}"$'\n'"${fld[2]}"$'\n'"${fld[3]}"$'\n'"${fld[4]}")
-  spec_file+=($n)
-  keep[n]=${fld[5]:-0}
-  case ${fld[1]} in
-    fake) todo+=($n) ;;
-    opt)  (( nopt++ )) ;;
-  esac
-done
-
-# --- 3. Window -----------------------------------------------------------------------
-# Stereo and mono files found, for information (several files selected)
-hidden=()
-(( n_stereo )) &amp;&amp; hidden+=("$(plural $n_stereo "stereo file")")
-(( n_mono ))   &amp;&amp; hidden+=("$(plural $n_mono "mono file")")
-count=${#todo}
-if (( count &gt; 0 &amp;&amp; nopt &gt; 0 )); then
-  if (( count == 1 )); then summary="1 file is 100% mono and will be converted, plus the ones you tick"
-  else summary="${count} files are 100% mono and will be converted, plus the ones you tick"; fi
-elif (( count == 1 )); then
-  summary="1 file is 100% mono and can be converted to mono"
-elif (( count &gt; 1 )); then
-  summary="${count} files are 100% mono and can be converted to mono"
-elif (( nopt &gt; 0 )); then
-  summary="Tick the files you want to convert to mono"
-else
-  summary="All good, no hidden mono file found!"
-fi
-(( ${#hidden} )) &amp;&amp; summary+=$'\n'"(${(j:, :)hidden})"
-if (( count + nopt == 1 )); then
-  over_text="Overwrite: replace the original file with a mono file. This cannot be undone."
-  dup_text="Duplicate: create a mono copy in a “${copydir}” subfolder, next to the original."
-elif (( count + nopt &gt; 1 )); then
-  over_text="Overwrite: replace the original files with mono files. This cannot be undone."
-  dup_text="Duplicate: create mono copies in a “${copydir}” subfolder, next to the originals."
-else
-  over_text="" dup_text=""
-fi
 
 /usr/bin/base64 --decode &gt; "$tmpdir/icon.png" 2&gt;/dev/null &lt;&lt;'ICON'
 iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAEAAElEQVR42uy9d5hkV3H+/znnps49
@@ -1942,6 +1778,344 @@ i4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLy3uW/xelrsbi0etWdgAAAABJ
 RU5ErkJggg==
 ICON
 
+# --- Progress window --------------------------------------------------------------------
+# While the files are analyzed or processed, a small window shows a progress bar, the
+# file being worked on, and a Cancel button. It only appears when the work lasts more
+# than a moment.
+#   progress_start TITLE         opens it (in the background)
+#   progress_set DONE TOTAL TEXT [DETAIL]
+#   progress_stop                closes it
+#   cancelled                    true once Cancel was clicked
+cat &gt; "$tmpdir/progress.applescript" &lt;&lt;'APPLESCRIPT'
+use AppleScript version "2.4"
+use framework "Foundation"
+use framework "AppKit"
+use scripting additions
+
+property progressPath : ""
+property cancelPath : ""
+property progressBar : missing value
+property mainLabel : missing value
+property detailLabel : missing value
+property centerValue : 1
+
+-- Arguments: title, progress file, cancel file, icon.
+-- The progress file holds three lines: "DONE TOTAL", the main text, the detail (a
+-- file name). With a TOTAL of 0 the bar just moves (amount not known yet). The window
+-- closes when the file is gone; Cancel creates the cancel file.
+on run argv
+	set ca to current application
+	set titleText to item 1 of argv
+	set my progressPath to item 2 of argv
+	set my cancelPath to item 3 of argv
+	set iconPath to item 4 of argv
+	-- short work: no window at all
+	delay 0.6
+	if not (my progressExists()) then return
+	if (do shell script "/usr/bin/uname -m") is "x86_64" then set my centerValue to 2
+	set textWidth to 360
+	set redColor to ca's NSColor's colorWithSRGBRed:0.94 green:0.58 blue:0.47 alpha:1.0
+	set yellowColor to ca's NSColor's colorWithSRGBRed:0.78 green:0.72 blue:0.48 alpha:0.85
+
+	set titleLabel to my makeLabel(titleText, ca's NSFont's boldSystemFontOfSize:18, redColor, textWidth, 24)
+	set my mainLabel to my makeLabel("Starting" &amp; (character id 8230), ca's NSFont's boldSystemFontOfSize:14, ca's NSColor's labelColor(), textWidth, 20)
+	set my detailLabel to my makeLabel("", ca's NSFont's systemFontOfSize:12, yellowColor, textWidth, 18)
+	(my detailLabel)'s setLineBreakMode:5 -- truncate in the middle
+	set my progressBar to ca's NSProgressIndicator's alloc()'s initWithFrame:{{0, 0}, {textWidth, 20}}
+	(my progressBar)'s setStyle:0 -- bar
+	(my progressBar)'s setIndeterminate:false
+	(my progressBar)'s setMinValue:0
+	(my progressBar)'s setMaxValue:1
+	(my progressBar)'s setDoubleValue:0
+
+	-- top to bottom: title, main text, bar, file name (AppKit's y axis goes up)
+	set container to ca's NSView's alloc()'s initWithFrame:{{0, 0}, {textWidth, 108}}
+	titleLabel's setFrameOrigin:{0, 84}
+	(my mainLabel)'s setFrameOrigin:{0, 56}
+	(my progressBar)'s setFrameOrigin:{0, 28}
+	(my detailLabel)'s setFrameOrigin:{0, 2}
+	repeat with v in {titleLabel, my mainLabel, my progressBar, my detailLabel}
+		container's addSubview:(contents of v)
+	end repeat
+
+	set theAlert to ca's NSAlert's alloc()'s init()
+	theAlert's setMessageText:""
+	theAlert's setInformativeText:""
+	set img to ca's NSImage's alloc()'s initWithContentsOfFile:iconPath
+	if img is not missing value then theAlert's setIcon:img
+	theAlert's setAccessoryView:container
+	set cancelButton to theAlert's addButtonWithTitle:"Cancel"
+	cancelButton's setKeyEquivalent:(character id 27)
+	theAlert's layout()
+	my tick:(missing value)
+	try
+		ca's NSApplication's sharedApplication()'s setActivationPolicy:1
+	end try
+	try
+		(theAlert's |window|())'s setLevel:3
+	end try
+	ca's NSApplication's sharedApplication()'s activateIgnoringOtherApps:true
+	set t to ca's NSTimer's timerWithTimeInterval:0.2 target:me selector:"tick:" userInfo:(missing value) repeats:true
+	(ca's NSRunLoop's currentRunLoop())'s addTimer:t forMode:(ca's NSModalPanelRunLoopMode)
+	set response to (theAlert's runModal()) as integer
+	t's invalidate()
+	-- Cancel (the work is still going on): tell the script
+	if response = 1000 then
+		(ca's NSString's stringWithString:"cancel")'s writeToFile:(my cancelPath) atomically:true encoding:4 |error|:(missing value)
+	end if
+end run
+
+on makeLabel(theText, theFont, theColor, textWidth, h)
+	set ca to current application
+	set field to ca's NSTextField's labelWithString:theText
+	field's setFont:theFont
+	field's setTextColor:theColor
+	field's setAlignment:(my centerValue)
+	field's setFrame:{{0, 0}, {textWidth, h}}
+	return field
+end makeLabel
+
+on progressExists()
+	return ((current application's NSFileManager's defaultManager()'s fileExistsAtPath:(my progressPath)) as boolean)
+end progressExists
+
+-- Every 0.2 s: read the progress file and update the window, or close it
+on tick:theTimer
+	set ca to current application
+	try
+		set s to ca's NSString's stringWithContentsOfFile:(my progressPath) encoding:4 |error|:(missing value)
+		if s is missing value then
+			if not (my progressExists()) then ca's NSApplication's sharedApplication()'s stopModalWithCode:2000
+			return
+		end if
+		set lns to paragraphs of (s as text)
+		if (count of lns) &lt; 1 then return
+		set nums to words of (item 1 of lns)
+		set doneCount to (item 1 of nums) as real
+		set total to (item 2 of nums) as real
+		if total &gt; 0 then
+			(my progressBar)'s stopAnimation:(missing value)
+			(my progressBar)'s setIndeterminate:false
+			(my progressBar)'s setMaxValue:total
+			(my progressBar)'s setDoubleValue:doneCount
+		else
+			-- total not known yet: a moving bar
+			(my progressBar)'s setIndeterminate:true
+			(my progressBar)'s startAnimation:(missing value)
+		end if
+		if (count of lns) &gt; 1 then (my mainLabel)'s setStringValue:(item 2 of lns)
+		if (count of lns) &gt; 2 then
+			(my detailLabel)'s setStringValue:(item 3 of lns)
+		else
+			(my detailLabel)'s setStringValue:""
+		end if
+	end try
+end tick:
+APPLESCRIPT
+
+progress_pid=""
+progress_start() {   # title
+  rm -f "$tmpdir/cancel"
+  print -r -- "0 0"$'\n'"Starting…" &gt; "$tmpdir/progress"
+  /usr/bin/osascript "$tmpdir/progress.applescript" "$1" "$tmpdir/progress" \
+    "$tmpdir/cancel" "$tmpdir/icon.png" &gt;/dev/null 2&gt;&amp;1 &amp;
+  progress_pid=$!
+}
+progress_set() {   # done total text [detail]
+  [[ -n $progress_pid ]] || return 0
+  print -r -- "$1 $2"$'\n'"$3"$'\n'"${4:-}" &gt; "$tmpdir/progress.tmp" \
+    &amp;&amp; mv -f "$tmpdir/progress.tmp" "$tmpdir/progress"
+}
+progress_stop() {
+  [[ -n $progress_pid ]] || return 0
+  rm -f "$tmpdir/progress"
+  # the window closes itself within 0.2 s once the file is gone
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 $progress_pid 2&gt;/dev/null || break
+    sleep 0.1
+  done
+  kill $progress_pid 2&gt;/dev/null
+  wait $progress_pid 2&gt;/dev/null
+  progress_pid=""
+}
+cancelled() { [[ -e $tmpdir/cancel ]] }
+
+# --- 1. Scan (headers only) and analyze every file -----------------------------------
+# Selected folders are searched with all their subfolders, for WAV, AIFF, CAF and
+# FLAC files only; every other file is ignored, and so are hidden files (such as
+# the "._" files macOS writes on external drives) and the "Mono" folders made by
+# Duplicate. Files found in a folder are shown with their path inside it.
+files=() labels=() infos=() folders=0
+add_folder() {   # folder
+  setopt localoptions extendedglob
+  local d=${1%/} g
+  for g in $d/**/*.(#i)(wav|aif|aiff|aifc|caf|flac)(N.n); do
+    [[ ${g#$d/} == (*/|)${copydir}/* ]] &amp;&amp; continue
+    files+=("$g"); labels+=("${g#$d/}")
+  done
+}
+for f in "$@"; do
+  if [[ -d $f ]]; then
+    (( folders++ )); add_folder "$f"
+  elif [[ -f $f ]]; then
+    files+=("$f"); labels+=("${f##*/}")
+  fi
+done
+if (( ${#files} == 0 )); then
+  if (( folders == 1 )); then
+    alert "No lossless audio file found" "There is no WAV, AIFF, CAF or FLAC file in the selected folder."
+  elif (( folders &gt; 1 )); then
+    alert "No lossless audio file found" "There is no WAV, AIFF, CAF or FLAC file in the selected folders."
+  fi
+  exit 0
+fi
+# headers are read 200 files at a time (long argument lists)
+for (( i = 1; i &lt;= ${#files}; i += 200 )); do
+  infos+=("${(@f)$(/usr/bin/perl "$pl" scan "${(@)files[i,i+199]}")}")
+done
+
+if [[ ${(M)infos:#(pcm|flac) *} == "" ]]; then
+  alert "No lossless audio file selected" "Find Mono works on WAV, AIFF, CAF and FLAC files."
+  exit 0
+fi
+
+progress_start "Find Mono"
+nlossless=${#${(M)infos:#(pcm|flac) *}}
+k=0
+pids=()
+for (( n = 1; n &lt;= ${#files}; n++ )); do
+  [[ ${infos[n]} == (pcm|flac)\ * ]] || continue
+  cancelled &amp;&amp; break
+  (( k++ ))
+  progress_set $(( k - 1 )) $nlossless "Analyzing $k of $nlossless" "${labels[n]}"
+  analyze $n "${files[n]}" &amp;
+  pids+=($!)
+  if (( ${#pids} &gt;= maxjobs )); then wait ${pids[1]}; shift pids; fi
+done
+wait
+progress_stop
+cancelled &amp;&amp; exit 0
+
+# --- 2. Results --------------------------------------------------------------------
+# kind: "fake" (converted), "opt" (converted if its box is ticked), "info" (shown
+# only) or "err"
+specs=()          # one entry per file shown
+spec_file=()      # file number of each entry (0: skipped / unreadable)
+todo=()           # fake stereo files: always converted
+keep=()           # channel kept for each file: 0 = left, 1 = right
+nopt=0         # files with a "Convert to mono" box
+# Several files selected: only the files with something to do are listed
+batch=$(( ${#files} &gt; 1 || folders &gt; 0 ))
+n_mono=0 n_stereo=0 n_other=0 n_lossy=0   # files left out of the list
+for (( n = 1; n &lt;= ${#files}; n++ )); do
+  name=${labels[n]}
+  r=""
+  [[ -f $tmpdir/a$n.res ]] &amp;&amp; r=$(&lt;"$tmpdir/a$n.res")
+  info=(${=infos[n]})
+  case ${info[1]} in
+    pcm)  bits=${info[3]}; [[ ${info[2]} == floating-point ]] &amp;&amp; bits=24 ;;
+    flac) bits=${info[2]} ;;
+    compressed) (( batch )) &amp;&amp; { (( n_lossy++ )); continue }
+                specs+=("${name}"$'\n'"!Skipped (compressed audio)"); spec_file+=(0); continue ;;
+    *)    (( batch )) &amp;&amp; { (( n_lossy++ )); continue }
+          specs+=("${name}"$'\n'"!Skipped (not a WAV, AIFF, CAF or FLAC file)"); spec_file+=(0); continue ;;
+  esac
+  # Fake stereo: both channels identical, or differing only by dither noise (a few
+  # steps of the file's resolution). Panned or inverted mono is reported, not
+  # converted. The correlation of the channels comes from the RMS levels:
+  # sum(L.R) = (rms(L+R)^2 - rms(L-R)^2) / 4.
+  out=$(print -r -- "$r" | awk -v bits="$bits" -v steps="$dither_steps" '
+    function db(x) { return x == "-inf" ? -1000 : x + 0 }
+    function lin(x) { return x &lt;= -1000 ? 0 : 10 ^ (x / 20) }
+    function abs(x) { return x &lt; 0 ? -x : x }
+    $1 == "ch" {
+      if ($2 == 1) print "info\tMono\tAlready a mono file"
+      else         print "info\t" $2 " channels\tNot a stereo file"
+      exit
+    }
+    $1 == "st" {
+      keepl = "Convert to mono (keep the left channel"; keepr = "Convert to mono (keep the right channel"
+      l = db($2); r = db($3); d = db($4); s = db($5)
+      thr = 20 * log(steps / 2 ^ (bits - 1)) / log(10); if (thr &gt; -60) thr = -60
+      if (l &lt;= -1000 &amp;&amp; r &lt;= -1000) { print "info\tSilent\tBoth channels are silent"; exit }
+      if (d &lt;= -1000) { print "fake\t100% Mono\tMono file disguised as a stereo file\t\t0"; exit }
+      if (d &lt;= thr) { print "fake\t100% Mono\tMono file disguised as a stereo file, apart from an inaudible dither noise\t\t0"; exit }
+      if (s &lt;= thr) { print "opt\tFake Mono\tMono signal, one channel with inverted polarity\t" keepl ")\t0"; exit }
+      if (r &lt;= -1000) { print "opt\tLeft channel only\tThe right channel is silent\t" keepl ")\t0"; exit }
+      if (l &lt;= -1000) { print "opt\tRight channel only\tThe left channel is silent\t" keepr ")\t1"; exit }
+      rl = lin($6); rr = lin($7); rd = lin($8); rs = lin($9)
+      rho = (rl &gt; 0 &amp;&amp; rr &gt; 0) ? (rs * rs - rd * rd) / (4 * rl * rr) : 0
+      res = 1 - rho * rho; if (res &lt; 1e-30) res = 1e-30
+      bal = db($6) - db($7)
+      below = (db($6) &gt; db($7) ? db($6) : db($7)) - db($8)   # difference vs. signal (RMS)
+      # 99.9% Mono: the difference stays at least 40 dB under the signal (1% in level)
+      if (10 * log(res) / log(10) &lt;= -50) {
+        if (rho &lt; 0) print "opt\tFake Mono\tMono signal, one channel with inverted polarity\t" keepl ")\t0"
+        else if (abs(bal) &gt;= 0.1)
+          printf "opt\tFake Mono\tMono signal panned to the %s (the %s channel is %.1f dB louder)\t%s\t%d\n", (bal &gt; 0 ? "left" : "right"), (bal &gt; 0 ? "left" : "right"), abs(bal), (bal &gt; 0 ? keepl ", the louder one)" : keepr ", the louder one)"), (bal &gt; 0 ? 0 : 1)
+        else printf "opt\t99.9%% Mono\tPractically mono: the difference between the channels is %.0f dB below the signal\t%s)\t0\n", below, keepl
+        exit
+      }
+      if (below &gt;= 40) { printf "opt\t99.9%% Mono\tPractically mono: the difference between the channels is %.0f dB below the signal\t%s)\t0\n", below, keepl; exit }
+      print "info\tReal stereo\t"
+      exit
+    }
+    { print "err" }')
+  if [[ -z $out || $out == err ]]; then
+    specs+=("${name}"$'\n'"!Not an audio file, or unreadable"); spec_file+=(0)
+    continue
+  fi
+  fld=("${(@ps:\t:)out}")
+  # Several files: mono, real stereo, silent or multichannel files are left out
+  if (( batch )) &amp;&amp; [[ ${fld[1]} == info ]]; then
+    case ${fld[2]} in
+      Mono)          (( n_mono++ )) ;;
+      "Real stereo") (( n_stereo++ )) ;;
+      *)             (( n_other++ )) ;;
+    esac
+    continue
+  fi
+  # lines: name / result (framed) / detail / checkbox title (optional conversion)
+  specs+=("${name}"$'\n'"${fld[2]}"$'\n'"${fld[3]}"$'\n'"${fld[4]}")
+  spec_file+=($n)
+  keep[n]=${fld[5]:-0}
+  case ${fld[1]} in
+    fake) todo+=($n) ;;
+    opt)  (( nopt++ )) ;;
+  esac
+done
+
+# --- 3. Window -----------------------------------------------------------------------
+# Stereo and mono files found, for information (several files selected)
+hidden=()
+(( n_stereo )) &amp;&amp; hidden+=("$(plural $n_stereo "stereo file")")
+(( n_mono ))   &amp;&amp; hidden+=("$(plural $n_mono "mono file")")
+count=${#todo}
+if (( count &gt; 0 &amp;&amp; nopt &gt; 0 )); then
+  if (( count == 1 )); then summary="1 file is 100% mono and will be converted, plus the ones you tick"
+  else summary="${count} files are 100% mono and will be converted, plus the ones you tick"; fi
+elif (( count == 1 )); then
+  summary="1 file is 100% mono and can be converted to mono"
+elif (( count &gt; 1 )); then
+  summary="${count} files are 100% mono and can be converted to mono"
+elif (( nopt &gt; 0 )); then
+  summary="Tick the files you want to convert to mono"
+else
+  summary="All good, no hidden mono file found!"
+fi
+(( ${#hidden} )) &amp;&amp; summary+=$'\n'"(${(j:, :)hidden})"
+if (( count + nopt == 1 )); then
+  over_text="Overwrite: replace the original file with a mono file. This cannot be undone."
+  dup_text="Duplicate: create a mono copy in a “${copydir}” subfolder, next to the original."
+elif (( count + nopt &gt; 1 )); then
+  over_text="Overwrite: replace the original files with mono files. This cannot be undone."
+  dup_text="Duplicate: create mono copies in a “${copydir}” subfolder, next to the originals."
+else
+  over_text="" dup_text=""
+fi
+
+
 # The window is a native alert, so that the text can use colors and bold:
 # AppleLoopEditor's coral red (logoRed) and vintage yellow (vintageYellow).
 cat &gt; "$tmpdir/dialog.applescript" &lt;&lt;'APPLESCRIPT'
@@ -2385,8 +2559,13 @@ if (( count == 0 )); then
 fi
 
 # --- 4. Convert, several files at a time ---------------------------------------------
+progress_start "Find Mono"
+k=0
 pids=()
 for n in "${todo[@]}"; do
+  cancelled &amp;&amp; break
+  (( k++ ))
+  progress_set $(( k - 1 )) ${#todo} "Converting $k of ${#todo}" "${labels[n]}"
   f=${files[n]}
   name=${f##*/}
   dir=${f%/*}; [[ -n $dir ]] || dir=/
@@ -2410,6 +2589,7 @@ for n in "${todo[@]}"; do
   if (( ${#pids} &gt;= maxjobs )); then wait ${pids[1]}; shift pids; fi
 done
 wait
+progress_stop
 
 # --- 5. Summary ------------------------------------------------------------------------
 done_count=0
@@ -2420,12 +2600,13 @@ for n in "${todo[@]}"; do
   case $r in
     ok)     (( done_count++ )) ;;
     err\ *) errors+="${labels[n]}: ${r#err }"$'\n' ;;
-    *)      errors+="${labels[n]}: unknown error"$'\n' ;;
+    *)      cancelled || errors+="${labels[n]}: unknown error"$'\n' ;;
   esac
 done
 result="$(plural $done_count file) converted to mono"
 (( done_count == 0 )) &amp;&amp; result="No file converted"
 [[ $mode == duplicate ]] &amp;&amp; (( done_count &gt; 0 )) &amp;&amp; result+=" → “${copydir}” folder"
+cancelled &amp;&amp; result+=" (cancelled)"
 if [[ -n $errors ]]; then
   alert "$result" "Errors:"$'\n'"${errors}"
 else

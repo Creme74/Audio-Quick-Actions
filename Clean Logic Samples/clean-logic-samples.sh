@@ -16,6 +16,8 @@
 #   link to an external drive), are left alone. If a library folder cannot be
 #   reached (drive not connected), its samples cannot be compared and stay.
 # - Everything goes to the Trash (Put Back works), nothing is deleted.
+# - A progress window with a Cancel button shows while the sessions are compared
+#   with the library.
 #
 # Runs with /bin/zsh; only macOS tools are used.
 
@@ -29,7 +31,7 @@ library=(
 export LC_NUMERIC=C
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/samplerdup.XXXXXX") || exit 1
-trap 'rm -rf "$tmpdir"' EXIT
+trap '[[ -n $progress_pid ]] && kill $progress_pid 2>/dev/null; rm -rf "$tmpdir"' EXIT
 pl="$tmpdir/scan.pl"
 cat > "$pl" <<'PERL'
 #!/usr/bin/perl
@@ -52,11 +54,14 @@ cat > "$pl" <<'PERL'
 #   OUTDIR/t<k> what to move to the Trash for session k, one path per line: a whole
 #               instrument folder when all its files are duplicates, else the files
 #   OUTDIR/unreachable  library folders that cannot be reached (drive not connected)
+# While it works, it updates OUTDIR/progress for the progress window (when that file
+# exists), and stops (exit 3) once OUTDIR/cancel appears.
 use strict;
 use warnings;
 use File::Find ();
 use File::Compare ();
 use Cwd ();
+use Time::HiRes ();
 
 my $outdir = shift @ARGV;
 my (@lib, @sel);
@@ -66,10 +71,29 @@ for (@ARGV) {
     push @$list, $_;
 }
 
+# --- Progress: at most 5 updates a second ---------------------------------------------
+my $progress = "$outdir/progress";
+my $show = -e $progress;
+my $last = 0;
+sub progress {   # done total text detail [now]
+    my ($done, $total, $text, $detail, $now) = @_;
+    my $t = Time::HiRes::time();
+    return if !$now && $t - $last < 0.2;
+    $last = $t;
+    exit 3 if -e "$outdir/cancel";
+    return unless $show;
+    if (open(my $p, '>', "$progress.tmp")) {
+        print $p "$done $total\n$text\n$detail\n";
+        close $p;
+        rename "$progress.tmp", $progress;
+    }
+}
+
 # --- Library index: "name\0size" -> paths ---------------------------------------
 my %index;
 my %libreal;        # real paths of the library folders (never touched)
 my @unreachable;
+my $nlib = 0;
 for my $root (@lib) {
     if (-l $root && !-e $root) { push @unreachable, $root; next }
     next unless -d $root;
@@ -92,6 +116,8 @@ for my $root (@lib) {
             my $size = -s _;
             return unless $size;
             push @{ $index{"$name\0$size"} }, $File::Find::name;
+            $nlib++;
+            progress(0, 0, "Reading your sample library\xe2\x80\xa6", "$nlib samples");
         },
     }, $root);
 }
@@ -114,6 +140,7 @@ for my $top (@sel) {
     File::Find::find({
         wanted => sub {
             my $name = $_;
+            progress(0, 0, "Looking for Logic sessions\xe2\x80\xa6", $File::Find::dir);
             # Logic 7 and earlier: a project file (.lso)
             if (-f $name && $name =~ /\.lso\z/i && $name !~ /^\./) {
                 $sessions{$File::Find::dir} ||= [$top];
@@ -155,8 +182,13 @@ close $un;
 
 my %seen_samples;
 my @rows;
-for my $proj (sort keys %sessions) {
+my @projs = sort keys %sessions;
+for my $i (0 .. $#projs) {
+    my $proj = $projs[$i];
     my ($top, @dirs) = @{ $sessions{$proj} };
+    my ($pname) = $proj =~ m{([^/]+)\z};
+    my $ptext = sprintf('Checking session %d of %d', $i + 1, scalar @projs);
+    progress($i, scalar @projs, $ptext, $pname, 1);
     my (%inst_files, %inst_bytes, %inst_dups);
     my ($files, $bytes) = (0, 0);
     for my $sdir (@dirs) {
@@ -170,6 +202,7 @@ for my $proj (sort keys %sessions) {
                     return;
                 }
                 return if $name =~ /^\./ || !-f $name || -l $name;
+                progress($i, scalar @projs, $ptext, $pname);
                 my $path = $File::Find::name;
                 my $rel = substr($path, length($sdir) + 1);
                 my $inst = $rel =~ m{^([^/]+)/} ? "$sdir/$1" : '';
@@ -235,54 +268,6 @@ human() {    # bytes -> "1.1 GB" (powers of 1000, like the Finder)
     else if (b >= 1e6) printf "%.0f MB", b / 1e6
     else               printf "%.0f KB", b / 1e3 }'
 }
-
-# --- 1. Scan --------------------------------------------------------------------------
-folders=()
-for f in "$@"; do [[ -d $f ]] && folders+=("${f%/}"); done
-(( ${#folders} )) || exit 0
-notify "Clean Logic Samples" "Comparing your sessions with the library…"
-out=$(/usr/bin/perl "$pl" "$tmpdir" "${library[@]}" -- "${folders[@]}" 2>"$tmpdir/scan.err")
-if [[ $out != checked\ * ]]; then
-  alert "Clean Logic Samples" "The sessions could not be read."$'\n\n'"$(head -c 400 "$tmpdir/scan.err")"
-  exit 0
-fi
-lines=("${(@f)out}")
-checked=${lines[1]#checked }
-if (( checked == 0 )); then
-  alert "No Logic session found" "There is no Logic project (.logicx, .logic or .lso) in the selected folder."
-  exit 0
-fi
-
-# each session: name, folder it is in, size of the copies, instruments
-specs=() total=0 nsess=0
-for (( k = 2; k <= ${#lines}; k++ )); do
-  fld=("${(@ps:\t:)lines[k]}")
-  (( nsess++ ))
-  (( total += fld[3] ))
-  where=${fld[2]}
-  [[ $where == $HOME || $where == $HOME/* ]] && where="~${where#$HOME}"
-  specs+=("${fld[1]}"$'\n'"${where}"$'\n'"$(human ${fld[3]})"$'\n'"${fld[4]}"$'\n'"Move to Trash")
-done
-
-# library folders that could not be reached
-missing=()
-if [[ -s $tmpdir/unreachable ]]; then
-  for u in "${(@f)$(<"$tmpdir/unreachable")}"; do missing+=("${u:t}"); done
-fi
-
-if (( nsess == 0 )); then
-  summary="All good, no library sample copied in your sessions!"
-  over_text=""
-else
-  if (( nsess == 1 )); then
-    summary="1 session holds $(human $total) of samples copied from your library"
-  else
-    summary="${nsess} sessions hold $(human $total) of samples copied from your library"
-  fi
-  over_text="Move to Trash: the copies leave the ticked sessions; Logic finds the same samples in your library when it opens them. The library itself is never touched."
-fi
-summary+=$'\n'"($(plural $checked session) checked)"
-(( ${#missing} )) && summary+=$'\n'"Not reachable, not compared: ${(j:, :)missing}"
 
 /usr/bin/base64 --decode > "$tmpdir/icon.png" 2>/dev/null <<'ICON'
 iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAEAAElEQVR42uy9d5hkV3H+/znnps49
@@ -1499,6 +1484,220 @@ i4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uL
 i4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLy3uW/xelrsbi0etWdgAAAABJ
 RU5ErkJggg==
 ICON
+
+# --- Progress window --------------------------------------------------------------------
+# While the files are analyzed or processed, a small window shows a progress bar, the
+# file being worked on, and a Cancel button. It only appears when the work lasts more
+# than a moment.
+#   progress_start TITLE         opens it (in the background)
+#   progress_set DONE TOTAL TEXT [DETAIL]
+#   progress_stop                closes it
+#   cancelled                    true once Cancel was clicked
+cat > "$tmpdir/progress.applescript" <<'APPLESCRIPT'
+use AppleScript version "2.4"
+use framework "Foundation"
+use framework "AppKit"
+use scripting additions
+
+property progressPath : ""
+property cancelPath : ""
+property progressBar : missing value
+property mainLabel : missing value
+property detailLabel : missing value
+property centerValue : 1
+
+-- Arguments: title, progress file, cancel file, icon.
+-- The progress file holds three lines: "DONE TOTAL", the main text, the detail (a
+-- file name). With a TOTAL of 0 the bar just moves (amount not known yet). The window
+-- closes when the file is gone; Cancel creates the cancel file.
+on run argv
+	set ca to current application
+	set titleText to item 1 of argv
+	set my progressPath to item 2 of argv
+	set my cancelPath to item 3 of argv
+	set iconPath to item 4 of argv
+	-- short work: no window at all
+	delay 0.6
+	if not (my progressExists()) then return
+	if (do shell script "/usr/bin/uname -m") is "x86_64" then set my centerValue to 2
+	set textWidth to 360
+	set redColor to ca's NSColor's colorWithSRGBRed:0.94 green:0.58 blue:0.47 alpha:1.0
+	set yellowColor to ca's NSColor's colorWithSRGBRed:0.78 green:0.72 blue:0.48 alpha:0.85
+
+	set titleLabel to my makeLabel(titleText, ca's NSFont's boldSystemFontOfSize:18, redColor, textWidth, 24)
+	set my mainLabel to my makeLabel("Starting" & (character id 8230), ca's NSFont's boldSystemFontOfSize:14, ca's NSColor's labelColor(), textWidth, 20)
+	set my detailLabel to my makeLabel("", ca's NSFont's systemFontOfSize:12, yellowColor, textWidth, 18)
+	(my detailLabel)'s setLineBreakMode:5 -- truncate in the middle
+	set my progressBar to ca's NSProgressIndicator's alloc()'s initWithFrame:{{0, 0}, {textWidth, 20}}
+	(my progressBar)'s setStyle:0 -- bar
+	(my progressBar)'s setIndeterminate:false
+	(my progressBar)'s setMinValue:0
+	(my progressBar)'s setMaxValue:1
+	(my progressBar)'s setDoubleValue:0
+
+	-- top to bottom: title, main text, bar, file name (AppKit's y axis goes up)
+	set container to ca's NSView's alloc()'s initWithFrame:{{0, 0}, {textWidth, 108}}
+	titleLabel's setFrameOrigin:{0, 84}
+	(my mainLabel)'s setFrameOrigin:{0, 56}
+	(my progressBar)'s setFrameOrigin:{0, 28}
+	(my detailLabel)'s setFrameOrigin:{0, 2}
+	repeat with v in {titleLabel, my mainLabel, my progressBar, my detailLabel}
+		container's addSubview:(contents of v)
+	end repeat
+
+	set theAlert to ca's NSAlert's alloc()'s init()
+	theAlert's setMessageText:""
+	theAlert's setInformativeText:""
+	set img to ca's NSImage's alloc()'s initWithContentsOfFile:iconPath
+	if img is not missing value then theAlert's setIcon:img
+	theAlert's setAccessoryView:container
+	set cancelButton to theAlert's addButtonWithTitle:"Cancel"
+	cancelButton's setKeyEquivalent:(character id 27)
+	theAlert's layout()
+	my tick:(missing value)
+	try
+		ca's NSApplication's sharedApplication()'s setActivationPolicy:1
+	end try
+	try
+		(theAlert's |window|())'s setLevel:3
+	end try
+	ca's NSApplication's sharedApplication()'s activateIgnoringOtherApps:true
+	set t to ca's NSTimer's timerWithTimeInterval:0.2 target:me selector:"tick:" userInfo:(missing value) repeats:true
+	(ca's NSRunLoop's currentRunLoop())'s addTimer:t forMode:(ca's NSModalPanelRunLoopMode)
+	set response to (theAlert's runModal()) as integer
+	t's invalidate()
+	-- Cancel (the work is still going on): tell the script
+	if response = 1000 then
+		(ca's NSString's stringWithString:"cancel")'s writeToFile:(my cancelPath) atomically:true encoding:4 |error|:(missing value)
+	end if
+end run
+
+on makeLabel(theText, theFont, theColor, textWidth, h)
+	set ca to current application
+	set field to ca's NSTextField's labelWithString:theText
+	field's setFont:theFont
+	field's setTextColor:theColor
+	field's setAlignment:(my centerValue)
+	field's setFrame:{{0, 0}, {textWidth, h}}
+	return field
+end makeLabel
+
+on progressExists()
+	return ((current application's NSFileManager's defaultManager()'s fileExistsAtPath:(my progressPath)) as boolean)
+end progressExists
+
+-- Every 0.2 s: read the progress file and update the window, or close it
+on tick:theTimer
+	set ca to current application
+	try
+		set s to ca's NSString's stringWithContentsOfFile:(my progressPath) encoding:4 |error|:(missing value)
+		if s is missing value then
+			if not (my progressExists()) then ca's NSApplication's sharedApplication()'s stopModalWithCode:2000
+			return
+		end if
+		set lns to paragraphs of (s as text)
+		if (count of lns) < 1 then return
+		set nums to words of (item 1 of lns)
+		set doneCount to (item 1 of nums) as real
+		set total to (item 2 of nums) as real
+		if total > 0 then
+			(my progressBar)'s stopAnimation:(missing value)
+			(my progressBar)'s setIndeterminate:false
+			(my progressBar)'s setMaxValue:total
+			(my progressBar)'s setDoubleValue:doneCount
+		else
+			-- total not known yet: a moving bar
+			(my progressBar)'s setIndeterminate:true
+			(my progressBar)'s startAnimation:(missing value)
+		end if
+		if (count of lns) > 1 then (my mainLabel)'s setStringValue:(item 2 of lns)
+		if (count of lns) > 2 then
+			(my detailLabel)'s setStringValue:(item 3 of lns)
+		else
+			(my detailLabel)'s setStringValue:""
+		end if
+	end try
+end tick:
+APPLESCRIPT
+
+progress_pid=""
+progress_start() {   # title
+  rm -f "$tmpdir/cancel"
+  print -r -- "0 0"$'\n'"Starting…" > "$tmpdir/progress"
+  /usr/bin/osascript "$tmpdir/progress.applescript" "$1" "$tmpdir/progress" \
+    "$tmpdir/cancel" "$tmpdir/icon.png" >/dev/null 2>&1 &
+  progress_pid=$!
+}
+progress_set() {   # done total text [detail]
+  [[ -n $progress_pid ]] || return 0
+  print -r -- "$1 $2"$'\n'"$3"$'\n'"${4:-}" > "$tmpdir/progress.tmp" \
+    && mv -f "$tmpdir/progress.tmp" "$tmpdir/progress"
+}
+progress_stop() {
+  [[ -n $progress_pid ]] || return 0
+  rm -f "$tmpdir/progress"
+  # the window closes itself within 0.2 s once the file is gone
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 $progress_pid 2>/dev/null || break
+    sleep 0.1
+  done
+  kill $progress_pid 2>/dev/null
+  wait $progress_pid 2>/dev/null
+  progress_pid=""
+}
+cancelled() { [[ -e $tmpdir/cancel ]] }
+
+# --- 1. Scan --------------------------------------------------------------------------
+folders=()
+for f in "$@"; do [[ -d $f ]] && folders+=("${f%/}"); done
+(( ${#folders} )) || exit 0
+progress_start "Clean Logic Samples"
+out=$(/usr/bin/perl "$pl" "$tmpdir" "${library[@]}" -- "${folders[@]}" 2>"$tmpdir/scan.err")
+progress_stop
+cancelled && exit 0
+if [[ $out != checked\ * ]]; then
+  alert "Clean Logic Samples" "The sessions could not be read."$'\n\n'"$(head -c 400 "$tmpdir/scan.err")"
+  exit 0
+fi
+lines=("${(@f)out}")
+checked=${lines[1]#checked }
+if (( checked == 0 )); then
+  alert "No Logic session found" "There is no Logic project (.logicx, .logic or .lso) in the selected folder."
+  exit 0
+fi
+
+# each session: name, folder it is in, size of the copies, instruments
+specs=() total=0 nsess=0
+for (( k = 2; k <= ${#lines}; k++ )); do
+  fld=("${(@ps:\t:)lines[k]}")
+  (( nsess++ ))
+  (( total += fld[3] ))
+  where=${fld[2]}
+  [[ $where == $HOME || $where == $HOME/* ]] && where="~${where#$HOME}"
+  specs+=("${fld[1]}"$'\n'"${where}"$'\n'"$(human ${fld[3]})"$'\n'"${fld[4]}"$'\n'"Move to Trash")
+done
+
+# library folders that could not be reached
+missing=()
+if [[ -s $tmpdir/unreachable ]]; then
+  for u in "${(@f)$(<"$tmpdir/unreachable")}"; do missing+=("${u:t}"); done
+fi
+
+if (( nsess == 0 )); then
+  summary="All good, no library sample copied in your sessions!"
+  over_text=""
+else
+  if (( nsess == 1 )); then
+    summary="1 session holds $(human $total) of samples copied from your library"
+  else
+    summary="${nsess} sessions hold $(human $total) of samples copied from your library"
+  fi
+  over_text="Move to Trash: the copies leave the ticked sessions; Logic finds the same samples in your library when it opens them. The library itself is never touched."
+fi
+summary+=$'\n'"($(plural $checked session) checked)"
+(( ${#missing} )) && summary+=$'\n'"Not reachable, not compared: ${(j:, :)missing}"
+
 cat > "$tmpdir/dialog.applescript" <<'APPLESCRIPT'
 use AppleScript version "2.4"
 use framework "Foundation"

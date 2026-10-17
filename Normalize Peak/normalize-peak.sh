@@ -5,6 +5,10 @@
 #   or Duplicate (copies in a "Normalized" subfolder of the source folder).
 # - Lossless formats only: WAV, AIFF/AIF/AIFC, CAF (uncompressed PCM) and FLAC.
 #   Lossy files (MP3, AAC/M4A...) are skipped.
+# - Works on files and on folders: a folder is searched with all its subfolders (its
+#   other files, hidden files and the "Normalized" folders are ignored).
+# - A progress window shows the files being normalized; Cancel stops after the files
+#   already started.
 # - File type, bit depth (8/16/24/32-bit, integer or float) and sample rate are kept.
 # - Files already at the requested level are not re-processed (only their date is updated).
 # - WAV / AIFF / CAF: the result is a byte-for-byte copy of the original in which only
@@ -33,7 +37,7 @@ for p in /opt/homebrew/bin/ffmpeg /usr/local/bin/ffmpeg; do
 done
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/peaknorm.XXXXXX") || exit 1
-trap 'rm -rf "$tmpdir"' EXIT
+trap '[[ -n $progress_pid ]] && kill $progress_pid 2>/dev/null; rm -rf "$tmpdir"' EXIT
 pl="$tmpdir/afmeta.pl"
 
 # --- File structure helper -------------------------------------------------------
@@ -358,16 +362,40 @@ flac_job() {   # n src out partial bits rate
 }
 
 # --- 1. Scan the selection (headers only) ----------------------------------------
-files=() infos=()
+# Selected folders are searched with all their subfolders, for WAV, AIFF, CAF and
+# FLAC files only; every other file is ignored, and so are hidden files and the
+# folders made by Duplicate. Files found in a folder are shown with their path in it.
+inputs=() inlabels=()
+add_folder() {   # folder
+  setopt localoptions extendedglob
+  local d=${1%/} g
+  for g in $d/**/*.(#i)(wav|aif|aiff|aifc|caf|flac)(N.n); do
+    [[ ${g#$d/} == (*/|)${copydir}/* ]] && continue
+    inputs+=("$g"); inlabels+=("${g#$d/}")
+  done
+}
+for f in "$@"; do
+  if [[ -d $f ]]; then
+    add_folder "$f"
+  elif [[ -f $f ]]; then
+    inputs+=("$f"); inlabels+=("${f##*/}")
+  fi
+done
+(( ${#inputs} )) || { alert "No lossless audio file found" "Supported formats: WAV, AIFF, CAF, FLAC."; exit 0; }
+
+files=() labels=() infos=() scan=()
 skipped=""
-scan=("${(@f)$(/usr/bin/perl "$pl" scan "$@")}")
-for (( i = 1; i <= $#; i++ )); do
-  f=${argv[i]}
+# headers are read 200 files at a time (long argument lists)
+for (( i = 1; i <= ${#inputs}; i += 200 )); do
+  scan+=("${(@f)$(/usr/bin/perl "$pl" scan "${(@)inputs[i,i+199]}")}")
+done
+for (( i = 1; i <= ${#inputs}; i++ )); do
+  f=${inputs[i]}
   case ${scan[i]} in
-    pcm\ *|flac\ *) files+=("$f"); infos+=("${scan[i]}") ;;
-    lossy)          skipped+="${f##*/}"$'\n' ;;
-    compressed)     skipped+="${f##*/} (compressed audio)"$'\n' ;;
-    unreadable)     skipped+="${f##*/} (unreadable file)"$'\n' ;;
+    pcm\ *|flac\ *) files+=("$f"); labels+=("${inlabels[i]}"); infos+=("${scan[i]}") ;;
+    lossy)          skipped+="${inlabels[i]}"$'\n' ;;
+    compressed)     skipped+="${inlabels[i]} (compressed audio)"$'\n' ;;
+    unreadable)     skipped+="${inlabels[i]} (unreadable file)"$'\n' ;;
   esac
 done
 
@@ -379,7 +407,7 @@ fi
 
 # --- 2. Target level, then Overwrite / Duplicate ----------------------------------
 if (( ${#files} == 1 )); then
-  what="“${files[1]##*/}”"
+  what="“${labels[1]}”"
   over_text="Overwrite: replace the original file. This cannot be undone."
   dup_text="Duplicate: create a normalized copy in a “${copydir}” subfolder, next to the original."
 else
@@ -391,8 +419,7 @@ head_text="Normalize ${what} to %LEVEL%."
 prompt_text="Normalize ${what}"$'\n'"Target peak level:"
 level_items=()
 for l in "${levels[@]}"; do level_items+=("$l dB"); done
-names=()
-for f in "${files[@]}"; do names+=("${f##*/}"); done
+names=("${labels[@]}")
 
 # Logo shown in the alert (PNG, base64)
 /usr/bin/base64 --decode > "$tmpdir/icon.png" 2>/dev/null <<'ICON'
@@ -1611,6 +1638,169 @@ i4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLy3uW/xelrsbi0etWdgAAAABJ
 RU5ErkJggg==
 ICON
 
+# --- Progress window --------------------------------------------------------------------
+# While the files are analyzed or processed, a small window shows a progress bar, the
+# file being worked on, and a Cancel button. It only appears when the work lasts more
+# than a moment.
+#   progress_start TITLE         opens it (in the background)
+#   progress_set DONE TOTAL TEXT [DETAIL]
+#   progress_stop                closes it
+#   cancelled                    true once Cancel was clicked
+cat > "$tmpdir/progress.applescript" <<'APPLESCRIPT'
+use AppleScript version "2.4"
+use framework "Foundation"
+use framework "AppKit"
+use scripting additions
+
+property progressPath : ""
+property cancelPath : ""
+property progressBar : missing value
+property mainLabel : missing value
+property detailLabel : missing value
+property centerValue : 1
+
+-- Arguments: title, progress file, cancel file, icon.
+-- The progress file holds three lines: "DONE TOTAL", the main text, the detail (a
+-- file name). With a TOTAL of 0 the bar just moves (amount not known yet). The window
+-- closes when the file is gone; Cancel creates the cancel file.
+on run argv
+	set ca to current application
+	set titleText to item 1 of argv
+	set my progressPath to item 2 of argv
+	set my cancelPath to item 3 of argv
+	set iconPath to item 4 of argv
+	-- short work: no window at all
+	delay 0.6
+	if not (my progressExists()) then return
+	if (do shell script "/usr/bin/uname -m") is "x86_64" then set my centerValue to 2
+	set textWidth to 360
+	set redColor to ca's NSColor's colorWithSRGBRed:0.94 green:0.58 blue:0.47 alpha:1.0
+	set yellowColor to ca's NSColor's colorWithSRGBRed:0.78 green:0.72 blue:0.48 alpha:0.85
+
+	set titleLabel to my makeLabel(titleText, ca's NSFont's boldSystemFontOfSize:18, redColor, textWidth, 24)
+	set my mainLabel to my makeLabel("Starting" & (character id 8230), ca's NSFont's boldSystemFontOfSize:14, ca's NSColor's labelColor(), textWidth, 20)
+	set my detailLabel to my makeLabel("", ca's NSFont's systemFontOfSize:12, yellowColor, textWidth, 18)
+	(my detailLabel)'s setLineBreakMode:5 -- truncate in the middle
+	set my progressBar to ca's NSProgressIndicator's alloc()'s initWithFrame:{{0, 0}, {textWidth, 20}}
+	(my progressBar)'s setStyle:0 -- bar
+	(my progressBar)'s setIndeterminate:false
+	(my progressBar)'s setMinValue:0
+	(my progressBar)'s setMaxValue:1
+	(my progressBar)'s setDoubleValue:0
+
+	-- top to bottom: title, main text, bar, file name (AppKit's y axis goes up)
+	set container to ca's NSView's alloc()'s initWithFrame:{{0, 0}, {textWidth, 108}}
+	titleLabel's setFrameOrigin:{0, 84}
+	(my mainLabel)'s setFrameOrigin:{0, 56}
+	(my progressBar)'s setFrameOrigin:{0, 28}
+	(my detailLabel)'s setFrameOrigin:{0, 2}
+	repeat with v in {titleLabel, my mainLabel, my progressBar, my detailLabel}
+		container's addSubview:(contents of v)
+	end repeat
+
+	set theAlert to ca's NSAlert's alloc()'s init()
+	theAlert's setMessageText:""
+	theAlert's setInformativeText:""
+	set img to ca's NSImage's alloc()'s initWithContentsOfFile:iconPath
+	if img is not missing value then theAlert's setIcon:img
+	theAlert's setAccessoryView:container
+	set cancelButton to theAlert's addButtonWithTitle:"Cancel"
+	cancelButton's setKeyEquivalent:(character id 27)
+	theAlert's layout()
+	my tick:(missing value)
+	try
+		ca's NSApplication's sharedApplication()'s setActivationPolicy:1
+	end try
+	try
+		(theAlert's |window|())'s setLevel:3
+	end try
+	ca's NSApplication's sharedApplication()'s activateIgnoringOtherApps:true
+	set t to ca's NSTimer's timerWithTimeInterval:0.2 target:me selector:"tick:" userInfo:(missing value) repeats:true
+	(ca's NSRunLoop's currentRunLoop())'s addTimer:t forMode:(ca's NSModalPanelRunLoopMode)
+	set response to (theAlert's runModal()) as integer
+	t's invalidate()
+	-- Cancel (the work is still going on): tell the script
+	if response = 1000 then
+		(ca's NSString's stringWithString:"cancel")'s writeToFile:(my cancelPath) atomically:true encoding:4 |error|:(missing value)
+	end if
+end run
+
+on makeLabel(theText, theFont, theColor, textWidth, h)
+	set ca to current application
+	set field to ca's NSTextField's labelWithString:theText
+	field's setFont:theFont
+	field's setTextColor:theColor
+	field's setAlignment:(my centerValue)
+	field's setFrame:{{0, 0}, {textWidth, h}}
+	return field
+end makeLabel
+
+on progressExists()
+	return ((current application's NSFileManager's defaultManager()'s fileExistsAtPath:(my progressPath)) as boolean)
+end progressExists
+
+-- Every 0.2 s: read the progress file and update the window, or close it
+on tick:theTimer
+	set ca to current application
+	try
+		set s to ca's NSString's stringWithContentsOfFile:(my progressPath) encoding:4 |error|:(missing value)
+		if s is missing value then
+			if not (my progressExists()) then ca's NSApplication's sharedApplication()'s stopModalWithCode:2000
+			return
+		end if
+		set lns to paragraphs of (s as text)
+		if (count of lns) < 1 then return
+		set nums to words of (item 1 of lns)
+		set doneCount to (item 1 of nums) as real
+		set total to (item 2 of nums) as real
+		if total > 0 then
+			(my progressBar)'s stopAnimation:(missing value)
+			(my progressBar)'s setIndeterminate:false
+			(my progressBar)'s setMaxValue:total
+			(my progressBar)'s setDoubleValue:doneCount
+		else
+			-- total not known yet: a moving bar
+			(my progressBar)'s setIndeterminate:true
+			(my progressBar)'s startAnimation:(missing value)
+		end if
+		if (count of lns) > 1 then (my mainLabel)'s setStringValue:(item 2 of lns)
+		if (count of lns) > 2 then
+			(my detailLabel)'s setStringValue:(item 3 of lns)
+		else
+			(my detailLabel)'s setStringValue:""
+		end if
+	end try
+end tick:
+APPLESCRIPT
+
+progress_pid=""
+progress_start() {   # title
+  rm -f "$tmpdir/cancel"
+  print -r -- "0 0"$'\n'"Starting…" > "$tmpdir/progress"
+  /usr/bin/osascript "$tmpdir/progress.applescript" "$1" "$tmpdir/progress" \
+    "$tmpdir/cancel" "$tmpdir/icon.png" >/dev/null 2>&1 &
+  progress_pid=$!
+}
+progress_set() {   # done total text [detail]
+  [[ -n $progress_pid ]] || return 0
+  print -r -- "$1 $2"$'\n'"$3"$'\n'"${4:-}" > "$tmpdir/progress.tmp" \
+    && mv -f "$tmpdir/progress.tmp" "$tmpdir/progress"
+}
+progress_stop() {
+  [[ -n $progress_pid ]] || return 0
+  rm -f "$tmpdir/progress"
+  # the window closes itself within 0.2 s once the file is gone
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 $progress_pid 2>/dev/null || break
+    sleep 0.1
+  done
+  kill $progress_pid 2>/dev/null
+  wait $progress_pid 2>/dev/null
+  progress_pid=""
+}
+cancelled() { [[ -e $tmpdir/cancel ]] }
+
 # One window, in the style of Analyze Loudness / Normalize Loudness: title in
 # AppleLoopEditor's coral red (logoRed), file names and texts in vintage yellow
 # (vintageYellow), target level menu, then Overwrite / Duplicate / Cancel.
@@ -1925,8 +2115,11 @@ maxjobs=$(/usr/sbin/sysctl -n hw.ncpu 2>/dev/null)
 (( maxjobs > 6 )) && maxjobs=6
 (( maxjobs < 1 )) && maxjobs=1
 
+progress_start "Normalize Peak"
 pids=()
 for (( n = 1; n <= ${#files}; n++ )); do
+  cancelled && break
+  progress_set $(( n - 1 )) ${#files} "Normalizing $n of ${#files}" "${labels[n]}"
   f=${files[n]}
   name=${f##*/}
   dir=${f%/*}; [[ -n $dir ]] || dir=/
@@ -1955,7 +2148,9 @@ for (( n = 1; n <= ${#files}; n++ )); do
     shift pids
   fi
 done
+# files already started are finished even after Cancel: none is left half written
 wait
+progress_stop
 
 # --- 4. Summary ------------------------------------------------------------------
 count=0 unchanged=0
@@ -1966,8 +2161,8 @@ for (( n = 1; n <= ${#files}; n++ )); do
   case $r in
     ok)     (( count++ )) ;;
     same)   (( unchanged++ )) ;;
-    err\ *) errors+="${files[n]##*/}: ${r#err }"$'\n' ;;
-    *)      errors+="${files[n]##*/}: unknown error"$'\n' ;;
+    err\ *) errors+="${labels[n]}: ${r#err }"$'\n' ;;
+    *)      cancelled || errors+="${labels[n]}: unknown error"$'\n' ;;
   esac
 done
 
@@ -1982,6 +2177,7 @@ if (( unchanged > 0 )); then
   fi
 fi
 [[ -n $summary ]] || summary="No file normalized"
+cancelled && summary+=" (cancelled)"
 [[ $mode == duplicate ]] && (( count + unchanged > 0 )) && summary+=" → “${copydir}” folder"
 
 report=""
