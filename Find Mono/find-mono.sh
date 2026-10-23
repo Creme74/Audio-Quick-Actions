@@ -2219,7 +2219,7 @@ done | awk -v steps="$dither_steps" '
         if (10 * log(res) / log(10) <= -50) {
           if (rho < 0) return "opt\tFake Mono\tMono signal, one channel with inverted polarity\t" keepl ")\t0"
           else if (abs(bal) >= 0.1)
-            return sprintf("opt\tFake Mono\tMono signal panned to the %s (the %s channel is %.1f dB louder)\t%s\t%d", (bal > 0 ? "left" : "right"), (bal > 0 ? "left" : "right"), abs(bal), (bal > 0 ? keepl ", the louder one)" : keepr ", the louder one)"), (bal > 0 ? 0 : 1))
+            return sprintf("opt\tFake Mono\tMono signal panned (the %s channel is %.1f dB louder)\t%s\t%d", (bal > 0 ? "left" : "right"), abs(bal), (bal > 0 ? keepl ", the louder one)" : keepr ", the louder one)"), (bal > 0 ? 0 : 1))
           else return sprintf("opt\t99.9%% Mono\tPractically mono: the difference between the channels is %.0f dB below the signal\t%s)\t0", below, keepl)
         }
         if (below >= 40) { return sprintf("opt\t99.9%% Mono\tPractically mono: the difference between the channels is %.0f dB below the signal\t%s)\t0", below, keepl) }
