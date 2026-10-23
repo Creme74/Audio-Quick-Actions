@@ -2225,6 +2225,15 @@ on makeLabel(body, textWidth)
 	on error
 		set textHeight to item 2 of fitSize
 	end try
+	-- fittingSize can say one line for a text that only just fits, which the label then
+	-- wraps and cuts: the height is also measured a little narrower, the larger one is kept
+	set safeSize to (field's cell())'s cellSizeForBounds:{{0, 0}, {textWidth - 8, 10000}}
+	try
+		set safeHeight to height of safeSize
+	on error
+		set safeHeight to item 2 of safeSize
+	end try
+	if safeHeight > textHeight then set textHeight to safeHeight
 	field's setFrame:{{0, 0}, {textWidth, textHeight}}
 	set my lastHeight to textHeight
 	return field
