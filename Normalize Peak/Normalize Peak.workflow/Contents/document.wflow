@@ -61,6 +61,8 @@
 					<key>COMMAND_STRING</key>
 					<string>#!/bin/zsh
 # Normalize Peak — macOS Finder Quick Action that peak-normalizes lossless audio files.
+# Needs nothing to be installed: macOS decodes and encodes the FLAC files (afconvert), and the peak and the
+# gain are computed in JavaScript by jsc (the JavaScriptCore engine of macOS).
 #
 # - One window: the target peak level, then Overwrite (replace the original files)
 #   or Duplicate (copies in a "Normalized" subfolder of the source folder).
@@ -75,10 +77,11 @@
 # - WAV / AIFF / CAF: the result is a byte-for-byte copy of the original in which only
 #   the audio samples are replaced, so Apple Loops metadata (tempo, key, tags,
 #   transients), markers, ID3 tags, Finder tags and Spotlight comments are preserved.
-# - FLAC: re-encoded to FLAC with ffmpeg, keeping tags and cover art.
+# - FLAC: decoded and re-encoded to FLAC by macOS (afconvert); every metadata block of
+#   the original (tags, cover art...) is put back in the new file.
 # - Several files are processed in parallel.
 #
-# Requires sox (WAV/AIFF/CAF) and ffmpeg (FLAC only). Runs with /bin/zsh.
+# Requires nothing but macOS. Runs with /bin/zsh.
 
 levels=(0 -0.1 -0.2 -0.5 -1)   # target peak levels offered, in dBFS
 default_level=0
@@ -87,18 +90,37 @@ copydir="Normalized"           # subfolder used by "Duplicate"
 
 export LC_NUMERIC=C
 
-# A native (Homebrew) sox is preferred: the standalone 2015 build is Intel-only
-# and runs through Rosetta on Apple Silicon.
-SOX="" FFMPEG=""
-for p in /opt/homebrew/bin/sox /usr/local/bin/sox /Applications/sox/sox; do
-  [[ -x $p ]] &amp;&amp; { SOX=$p; break; }
-done
-for p in /opt/homebrew/bin/ffmpeg /usr/local/bin/ffmpeg; do
-  [[ -x $p ]] &amp;&amp; { FFMPEG=$p; break; }
-done
+# jsc, the JavaScript engine built into macOS (JavaScriptCore). Its readFile and
+# writeFile functions read and write the audio; writeFile came with macOS 13 Ventura,
+# so both are checked before anything is done.
+JSC=/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc
+
+# macOS cannot read a FLAC file that starts with an ID3 tag (not standard, but some
+# programs write one): such a file is decoded from a copy without the tag.
+afconvert_any() {   # afconvert options... INPUT OUTPUT
+  local in=${@[-2]} out=${@[-1]} skip t r
+  /usr/bin/afconvert "$@" 2&gt;/dev/null &amp;&amp; return 0
+  [[ $(head -c 3 "$in" 2&gt;/dev/null) == ID3 ]] || return 1
+  skip=$(/usr/bin/perl -e 'open(F, "&lt;:raw", $ARGV[0]) or exit; read(F, my $h, 10) == 10 or exit;
+    my @b = unpack("C4", substr($h, 6, 4)); my $n = 10 + (($b[0] &lt;&lt; 21) | ($b[1] &lt;&lt; 14) | ($b[2] &lt;&lt; 7) | $b[3]);
+    $n += 10 if ord(substr($h, 3, 1)) == 4 &amp;&amp; (ord(substr($h, 5, 1)) &amp; 0x10); print $n' "$in")
+  [[ $skip == &lt;-&gt; ]] || return 1
+  t="$out.noid3.${in:e}"
+  if tail -c +$(( skip + 1 )) "$in" &gt; "$t"; then
+    /usr/bin/afconvert "${@[1,-3]}" "$t" "$out" 2&gt;/dev/null; r=$?
+  else
+    r=1
+  fi
+  rm -f "$t"
+  return $r
+}
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/peaknorm.XXXXXX") || exit 1
 trap '[[ -n $progress_pid ]] &amp;&amp; kill $progress_pid 2&gt;/dev/null; rm -rf "$tmpdir"' EXIT
+
+# Waits for every job given. (zsh's "wait pid1 pid2..." returns as soon as one of the
+# jobs has ended with an error, without waiting for the others.)
+wait_all() { local p; for p in "$@"; do wait $p 2&gt;/dev/null; done }
 pl="$tmpdir/afmeta.pl"
 
 # --- File structure helper -------------------------------------------------------
@@ -108,6 +130,9 @@ pl="$tmpdir/afmeta.pl"
 #   extract FILE OFFSET LENGTH   writes the audio bytes to stdout
 #   splice FILE OFFSET LENGTH RAW  overwrites the audio bytes with RAW (same size)
 #   flacinfo FILE                prints "BITS RATE"
+#   flacmerge ORIG ENC OUT       OUT = ENC (a FLAC file encoded by macOS) with the
+#                                metadata blocks of ORIG (tags, pictures...) instead of
+#                                its own; STREAMINFO is ENC's, ORIG's SEEKTABLE is dropped
 cat &gt; "$pl" &lt;&lt;'PERL'
 use strict; use warnings;
 my $mode = shift @ARGV // '';
@@ -139,6 +164,11 @@ if ($mode eq 'splice') {
     while (read($in, $buf, 1048576)) { print {$out} $buf or exit 1 }
     close($out) or exit 1;
     exit 0;
+}
+if ($mode eq 'flacmerge') {
+    my $ok = eval { flac_merge(@ARGV); 1 };
+    unlink $ARGV[2] unless $ok;
+    exit($ok ? 0 : 1);
 }
 if ($mode eq 'flacinfo') {
     my @r = eval { open(my $fh, '&lt;:raw', $ARGV[0]) or die "open\n"; flac($fh) };
@@ -266,6 +296,55 @@ sub caf {
             clamp_len($size, $doff, $dlen, $bpp), $ch, rate_ok($rate));
 }
 
+# metadata blocks of a FLAC file: (list of [type, data], offset of the audio frames)
+sub flac_blocks {
+    my ($fh) = @_;
+    my $m;
+    read($fh, $m, 4) == 4 &amp;&amp; $m eq 'fLaC' or die "flac\n";
+    my ($pos, $last, @b) = (4, 0);
+    until ($last) {
+        read($fh, my $h, 4) == 4 or die "short\n";
+        my $b0 = ord(substr($h, 0, 1));
+        $last = $b0 &amp; 0x80;
+        my $len = unpack('N', "\0" . substr($h, 1, 3));
+        my $d = '';
+        $len == 0 || read($fh, $d, $len) == $len or die "short\n";
+        push @b, [$b0 &amp; 0x7F, $d];
+        $pos += 4 + $len;
+    }
+    return (\@b, $pos);
+}
+sub flac_merge {
+    my ($orig, $enc, $out) = @_;
+    open(my $o, '&lt;:raw', $orig) or die "open\n";
+    open(my $e, '&lt;:raw', $enc) or die "open\n";
+    # an ID3 tag in front of the original FLAC data is kept in front of the new one
+    my ($pre, $h) = ('', '');
+    read($o, $h, 10);
+    if (length($h) == 10 &amp;&amp; substr($h, 0, 3) eq 'ID3') {
+        my @s = unpack('C4', substr($h, 6, 4));
+        my $n = 10 + (($s[0] &lt;&lt; 21) | ($s[1] &lt;&lt; 14) | ($s[2] &lt;&lt; 7) | $s[3]);
+        $n += 10 if ord(substr($h, 3, 1)) == 4 &amp;&amp; (ord(substr($h, 5, 1)) &amp; 0x10);
+        seek($o, 0, 0); read($o, $pre, $n) == $n or die "short\n";
+    } else {
+        seek($o, 0, 0);
+    }
+    my ($ob) = flac_blocks($o);
+    my ($eb, $audio) = flac_blocks($e);
+    $eb-&gt;[0][0] == 0 or die "streaminfo\n";
+    my @blocks = ($eb-&gt;[0], grep { $_-&gt;[0] != 0 &amp;&amp; $_-&gt;[0] != 3 } @$ob);
+    open(my $w, '&gt;:raw', $out) or die "create\n";
+    print {$w} $pre, 'fLaC' or die "write\n";
+    for my $i (0 .. $#blocks) {
+        my ($t, $d) = @{ $blocks[$i] };
+        print {$w} chr(($i == $#blocks ? 0x80 : 0) | $t), substr(pack('N', length $d), 1, 3), $d or die "write\n";
+    }
+    seek($e, $audio, 0) or die "seek\n";
+    my $buf;
+    while (read($e, $buf, 1048576)) { print {$w} $buf or die "write\n" }
+    close($w) or die "write\n";
+}
+
 sub flac {   # STREAMINFO, after an optional ID3v2 tag
     my ($fh) = @_;
     read($fh, my $h, 10) == 10 or die "short\n";
@@ -298,6 +377,137 @@ plural() {   # plural 3 file -&gt; "3 files"
   if (( $1 == 1 )); then print -r -- "$1 $2"; else print -r -- "$1 $2s"; fi
 }
 
+if [[ ! -x $JSC || $("$JSC" -e 'print(typeof readFile + typeof writeFile)' 2&gt;/dev/null) != functionfunction ]]; then
+  alert "macOS 13 or later needed" "Normalize Peak needs macOS 13 Ventura or later: it uses jsc, the JavaScript engine built into macOS, which is missing or too old on this Mac."
+  exit 0
+fi
+
+# The peak measurement and the gain, in JavaScript (run by jsc)
+jsg="$tmpdir/gain.js"
+cat &gt; "$jsg" &lt;&lt;'JAVASCRIPT'
+// Gain for Normalize Peak, run by jsc (the JavaScript engine of macOS).
+//   jsc gain.js -- pcm SRC OFFSET LENGTH ENC BITS ENDIAN GAIN_DB OUT
+//       the audio bytes of SRC (OFFSET, LENGTH; ENC signed-integer, unsigned-integer or
+//       floating-point; BITS 8 to 64; ENDIAN L or B) with the gain applied -&gt; OUT
+//   jsc gain.js -- wav IN.wav OUT.wav GAIN_DB
+//       a 16/24/32-bit integer WAV (from afconvert): the same file with the gain applied
+// With "peak" instead of a gain in dB ("peak LEVEL_DB TOLERANCE_DB"), the sample peak is
+// measured first (relative to full scale, like sox and ffmpeg): if it is within the
+// tolerance of LEVEL_DB, nothing is written and "same" is printed; a silent file gives
+// "silent"; otherwise the gain that brings the peak to LEVEL_DB is applied.
+// Integer samples are rounded to the nearest value (16-bit and lower first get a TPDF
+// dither of +-1 LSB, like sox does) and clipped to the format's range; float samples
+// are just multiplied. Prints "ok", or "err MESSAGE".
+function process(u, off, len, enc, bits, big, g, lim) {
+  var bytes = bits &gt;&gt; 3, n = Math.floor(len / bytes);
+  if (enc === 'floating-point') {
+    var dv = new DataView(u.buffer, u.byteOffset + off, n * bytes), le = !big, i;
+    if (bits === 32) for (i = 0; i &lt; n; i++) dv.setFloat32(4 * i, dv.getFloat32(4 * i, le) * g, le);
+    else if (bits === 64) for (i = 0; i &lt; n; i++) dv.setFloat64(8 * i, dv.getFloat64(8 * i, le) * g, le);
+    else throw new Error('unsupported float format');
+    return;
+  }
+  if (bytes &lt; 1 || bytes &gt; 4) throw new Error('unsupported integer format');
+  var unsigned = enc === 'unsigned-integer', dither = bits &lt;= 16;
+  var max = Math.pow(2, bits - 1) - 1, min = -Math.pow(2, bits - 1), sh = 32 - bits;
+  // peak normalization: the dither must not take a sample past the requested level
+  if (lim !== undefined) {
+    var l = Math.floor(lim * Math.pow(2, bits - 1) + 1e-9);
+    if (l &lt; max) max = l;
+    if (-l &gt; min) min = -l;
+  }
+  for (var s = 0, p = off; s &lt; n; s++, p += bytes) {
+    // read
+    var v = 0, k;
+    if (big) for (k = 0; k &lt; bytes; k++) v = v * 256 + u[p + k];
+    else for (k = bytes - 1; k &gt;= 0; k--) v = v * 256 + u[p + k];
+    if (unsigned) v -= 128;                         // 8-bit WAV: unsigned
+    else v = (v &lt;&lt; sh) &gt;&gt; sh;                       // sign extension (bits &lt;= 32)
+    // gain, dither, round, clip
+    var y = v * g;
+    if (dither) y += Math.random() + Math.random() - 1;
+    y = Math.round(y);
+    if (y &gt; max) y = max; else if (y &lt; min) y = min;
+    if (unsigned) y += 128;
+    // write
+    var w = y &lt; 0 ? y + 4294967296 : y;           // two's complement on 32 bits
+    if (big) for (k = bytes - 1; k &gt;= 0; k--) { u[p + k] = w &amp; 255; w = Math.floor(w / 256); }
+    else for (k = 0; k &lt; bytes; k++) { u[p + k] = w &amp; 255; w = Math.floor(w / 256); }
+  }
+}
+
+// largest absolute sample, relative to full scale
+function peakOf(u, off, len, enc, bits, big) {
+  var bytes = bits &gt;&gt; 3, n = Math.floor(len / bytes), m = 0, i, v, k;
+  if (enc === 'floating-point') {
+    var dv = new DataView(u.buffer, u.byteOffset + off, n * bytes), le = !big;
+    if (bits === 32) for (i = 0; i &lt; n; i++) { v = Math.abs(dv.getFloat32(4 * i, le)); if (v &gt; m) m = v; }
+    else if (bits === 64) for (i = 0; i &lt; n; i++) { v = Math.abs(dv.getFloat64(8 * i, le)); if (v &gt; m) m = v; }
+    else throw new Error('unsupported float format');
+    return m;
+  }
+  var unsigned = enc === 'unsigned-integer', sh = 32 - bits;
+  for (var s = 0, p = off; s &lt; n; s++, p += bytes) {
+    v = 0;
+    if (big) for (k = 0; k &lt; bytes; k++) v = v * 256 + u[p + k];
+    else for (k = bytes - 1; k &gt;= 0; k--) v = v * 256 + u[p + k];
+    if (unsigned) v -= 128; else v = (v &lt;&lt; sh) &gt;&gt; sh;
+    if (v &lt; 0) v = -v;
+    if (v &gt; m) m = v;
+  }
+  return m / Math.pow(2, bits - 1);
+}
+
+// "peak LEVEL TOL" or a gain in dB -&gt; gain factor, or "same" / "silent"
+function decide(args, i, u, off, len, enc, bits, big) {
+  if (args[i] !== 'peak') return { g: Math.pow(10, +args[i] / 20), n: 1 };
+  var level = +args[i + 1], tol = +args[i + 2], p = peakOf(u, off, len, enc, bits, big);
+  if (!(p &gt; 0)) return { stop: 'silent', n: 3 };
+  var db = 20 * Math.log10(p);
+  if (Math.abs(level - db) &lt; tol) return { stop: 'same', n: 3 };
+  return { g: Math.pow(10, (level - db) / 20), n: 3, lim: Math.pow(10, level / 20) };
+}
+
+function wavData(u) {
+  var dv = new DataView(u.buffer, u.byteOffset, u.byteLength), pos = 12, fmt = -1, bits = 0, data = -1, len = 0;
+  if (String.fromCharCode(u[0], u[1], u[2], u[3]) !== 'RIFF') throw new Error('not a WAV file');
+  while (pos + 8 &lt;= u.byteLength) {
+    var id = String.fromCharCode(u[pos], u[pos + 1], u[pos + 2], u[pos + 3]), size = dv.getUint32(pos + 4, true);
+    if (id === 'fmt ') { fmt = dv.getUint16(pos + 8, true); bits = 8 * dv.getUint16(pos + 20, true) / dv.getUint16(pos + 10, true); }
+    if (id === 'data') { data = pos + 8; len = Math.min(size, u.byteLength - data); break; }
+    pos += 8 + size + (size &amp; 1);
+  }
+  if (data &lt; 0 || (fmt !== 1 &amp;&amp; fmt !== 0xFFFE)) throw new Error('unexpected WAV file');
+  return { off: data, len: len, bits: bits };
+}
+
+function main(a) {
+  try {
+    var d, u;
+    if (a[0] === 'pcm') {
+      var src = readFile(a[1], 'binary'), off = +a[2], len = +a[3], big = a[6] === 'B';
+      if (off + len &gt; src.length) throw new Error('short file');
+      var raw = new Uint8Array(src.buffer, src.byteOffset + off, len);
+      d = decide(a, 7, raw, 0, len, a[4], +a[5], big);
+      if (d.stop) { print(d.stop); return; }
+      process(raw, 0, len, a[4], +a[5], big, d.g, d.lim);
+      writeFile(a[7 + d.n], raw.slice());
+    } else if (a[0] === 'wav') {
+      u = readFile(a[1], 'binary');
+      var w = wavData(u);
+      d = decide(a, 3, u, w.off, w.len, 'signed-integer', w.bits, false);
+      if (d.stop) { print(d.stop); return; }
+      process(u, w.off, w.len, 'signed-integer', w.bits, false, d.g, d.lim);
+      writeFile(a[2], u);
+    } else throw new Error('mode');
+    print('ok');
+  } catch (e) {
+    print('err ' + e.message);
+  }
+}
+main(arguments);
+JAVASCRIPT
+
 # --- Jobs ------------------------------------------------------------------------
 # Each job runs in the background and writes one line to $tmpdir/&lt;n&gt;.res:
 #   "ok", "same" (already at the requested level) or "err &lt;message&gt;".
@@ -315,38 +525,23 @@ keep_as_is() {   # src out partial res — file already at the requested level
   print same &gt; "$4"
 }
 
-# WAV / AIFF / CAF. A single sox run measures the peak ("stat") and renders the
-# normalized samples ("--norm") as raw audio in exactly the original sample format;
-# they are then written over the audio data of an exact copy of the original.
+# WAV / AIFF / CAF. A single jsc run measures the peak and renders the normalized
+# samples as raw audio in exactly the original sample format (16-bit and lower get a
+# light TPDF dither); they are then written over the audio data of an exact copy of
+# the original.
 pcm_job() {   # n src out partial enc bits endian offset length channels rate
   local n=$1 src=$2 out=$3 part=$4 off=$8 len=$9
-  local raw="$tmpdir/$n.raw" st="$tmpdir/$n.stat" res="$tmpdir/$n.res" verdict
-  local -a fmt
-  fmt=(-t raw -e "$5" -b "$6" "-$7")
+  local raw="$tmpdir/$n.raw" res="$tmpdir/$n.res" link="$tmpdir/$n.link" r
 
-  [[ -n $SOX ]] || { print -r -- "err sox not found" &gt; "$res"; return; }
-  if ! /usr/bin/perl "$pl" extract "$src" "$off" "$len" \
-     | "$SOX" -V1 --norm="$level" "${fmt[@]}" -c "${10}" -r "${11}" - "${fmt[@]}" "$raw" \
-         stat 2&gt; "$st"; then
-    rm -f "$raw"; print -r -- "err sox failed" &gt; "$res"; return
-  fi
-
-  verdict=$(awk -v t="$level" -v tol="$tolerance" '
-    /^Maximum amplitude/ { mx = $3; seen = 1 }
-    /^Minimum amplitude/ { mn = $3 }
-    END {
-      if (!seen) { print "err"; exit }
-      a = mx &lt; 0 ? -mx : mx; b = mn &lt; 0 ? -mn : mn; p = a &gt; b ? a : b
-      if (p &lt;= 0) { print "silent"; exit }
-      d = t - 20 * log(p) / log(10); if (d &lt; 0) d = -d
-      print (d &lt; tol ? "same" : "change")
-    }' "$st")
-
-  case $verdict in
-    change) ;;
+  # (jsc gets a link with a plain name: it cannot open names with accents or symbols)
+  ln -sf "$src" "$link"
+  r=$("$JSC" "$jsg" -- pcm "$link" "$off" "$len" "$5" "$6" "$7" peak "$level" "$tolerance" "$raw" 2&gt;/dev/null)
+  rm -f "$link"
+  case $r in
+    ok)     ;;
     same)   rm -f "$raw"; keep_as_is "$src" "$out" "$part" "$res"; return ;;
     silent) rm -f "$raw"; print -r -- "err silent file" &gt; "$res"; return ;;
-    *)      rm -f "$raw"; print -r -- "err could not measure the level" &gt; "$res"; return ;;
+    *)      rm -f "$raw"; print -r -- "err ${${r#err }:-could not measure the level}" &gt; "$res"; return ;;
   esac
 
   if ! cp -p "$src" "$part"; then
@@ -363,63 +558,48 @@ pcm_job() {   # n src out partial enc bits endian offset length channels rate
   fi
 }
 
-# Peak of a FLAC file, compared with the target:
-#   "same" | "silent" | "change &lt;gain dB&gt;" | "err"
-flac_verdict() {
-  local v af
-  for af in astats=measure_perchannel=none:measure_overall=Peak_level astats; do
-    v=$("$FFMPEG" -nostdin -hide_banner -nostats -i "$1" -map 0:a:0 -af "$af" -f null - 2&gt;&amp;1 \
-      | awk -v t="$level" -v tol="$tolerance" '
-          /Peak level dB/ { p = $NF; seen = 1 }
-          END {
-            if (!seen) { print "err"; exit }
-            if (p ~ /inf/) { print "silent"; exit }
-            d = t - p; a = d &lt; 0 ? -d : d
-            if (a &lt; tol) print "same"; else printf "change %.6f\n", d
-          }')
-    [[ $v != err ]] &amp;&amp; break
-  done
-  print -r -- "$v"
-}
-
-# FLAC: decode, apply gain, re-encode to FLAC with the same bit depth and sample
-# rate; the result is checked before it is kept.
+# FLAC: macOS decodes the file, jsc measures the peak and applies the gain, macOS
+# encodes it again to FLAC with the same bit depth and sample rate, and the metadata
+# blocks of the original (tags, cover art...) are put back; the result is checked
+# before it is kept.
 flac_job() {   # n src out partial bits rate
   local n=$1 src=$2 out=$3 part=$4 bits=$5 rate=$6
-  local enc="$tmpdir/$n.flac" res="$tmpdir/$n.res" verdict conv
-  local -a fmt
+  local w1="$tmpdir/$n.in.wav" w2="$tmpdir/$n.out.wav" enc="$tmpdir/$n.enc.flac"
+  local new="$tmpdir/$n.flac" res="$tmpdir/$n.res" r
 
-  [[ -n $FFMPEG ]] || { print -r -- "err ffmpeg not found (required for FLAC)" &gt; "$res"; return; }
   case $bits in
-    16) fmt=(-sample_fmt s16); conv="aresample=osf=s16:dither_method=triangular" ;;
-    24) fmt=(-sample_fmt s32 -bits_per_raw_sample 24); conv="aresample=osf=s32" ;;
-    32) fmt=(-sample_fmt s32 -bits_per_raw_sample 32 -strict experimental); conv="aresample=osf=s32" ;;
-    *)  print -r -- "err unsupported FLAC bit depth (${bits}-bit)" &gt; "$res"; return ;;
+    16|24) ;;
+    *) print -r -- "err unsupported FLAC bit depth (${bits}-bit)" &gt; "$res"; return ;;
   esac
-
-  verdict=$(flac_verdict "$src")
-  case $verdict in
-    change\ *) ;;
-    same)   keep_as_is "$src" "$out" "$part" "$res"; return ;;
-    silent) print -r -- "err silent file" &gt; "$res"; return ;;
-    *)      print -r -- "err could not measure the level" &gt; "$res"; return ;;
-  esac
-
-  if ! "$FFMPEG" -nostdin -v error -y -i "$src" -map 0:a:0 -map '0:v?' -map_metadata 0 \
-       -c copy -c:a flac "${fmt[@]}" -ar "$rate" \
-       -af "volume=${verdict#change }dB:precision=double,${conv}" "$enc"; then
-    rm -f "$enc"; print -r -- "err ffmpeg failed" &gt; "$res"; return
+  if ! afconvert_any -f WAVE -d LEI$bits "$src" "$w1"; then
+    rm -f "$w1"; print -r -- "err macOS could not read the file" &gt; "$res"; return
   fi
-  if [[ $(/usr/bin/perl "$pl" flacinfo "$enc") != "$bits $rate" ]]; then
-    rm -f "$enc"; print -r -- "err bit depth or sample rate changed, file not written" &gt; "$res"; return
+  r=$("$JSC" "$jsg" -- wav "$w1" "$w2" peak "$level" "$tolerance" 2&gt;/dev/null)
+  rm -f "$w1"
+  case $r in
+    ok)     ;;
+    same)   rm -f "$w2"; keep_as_is "$src" "$out" "$part" "$res"; return ;;
+    silent) rm -f "$w2"; print -r -- "err silent file" &gt; "$res"; return ;;
+    *)      rm -f "$w2"; print -r -- "err ${${r#err }:-could not measure the level}" &gt; "$res"; return ;;
+  esac
+  if ! /usr/bin/afconvert -f flac -d flac "$w2" "$enc" 2&gt;/dev/null; then
+    rm -f "$w2" "$enc"; print -r -- "err FLAC encoding failed" &gt; "$res"; return
+  fi
+  rm -f "$w2"
+  if ! /usr/bin/perl "$pl" flacmerge "$src" "$enc" "$new"; then
+    rm -f "$enc" "$new"; print -r -- "err unexpected file structure" &gt; "$res"; return
+  fi
+  rm -f "$enc"
+  if [[ $(/usr/bin/perl "$pl" flacinfo "$new") != "$bits $rate" ]]; then
+    rm -f "$new"; print -r -- "err bit depth or sample rate changed, file not written" &gt; "$res"; return
   fi
   # cp -p, then overwrite the content: Finder tags / extended attributes are kept
-  if cp -p "$src" "$part" &amp;&amp; cat "$enc" &gt; "$part" &amp;&amp; mv -f "$part" "$out"; then
+  if cp -p "$src" "$part" &amp;&amp; cat "$new" &gt; "$part" &amp;&amp; mv -f "$part" "$out"; then
     print ok &gt; "$res"
   else
     rm -f "$part"; print -r -- "err could not write the file" &gt; "$res"
   fi
-  rm -f "$enc"
+  rm -f "$new"
 }
 
 # --- 1. Scan the selection (headers only) ----------------------------------------
@@ -1875,6 +2055,7 @@ property centerValue : 1
 property centeredStyle : missing value
 property redColor : missing value
 property yellowColor : missing value
+property nameColor : missing value
 property logo : missing value
 property lastHeight : 0
 
@@ -1921,6 +2102,8 @@ on setupStyle(iconPath)
 	set ca to current application
 	set my redColor to ca's NSColor's colorWithSRGBRed:0.94 green:0.58 blue:0.47 alpha:1.0
 	set my yellowColor to ca's NSColor's colorWithSRGBRed:0.78 green:0.72 blue:0.48 alpha:0.85
+	-- file names: a soft, slightly warm white, quieter than the white of the values
+	set my nameColor to ca's NSColor's colorWithSRGBRed:0.78 green:0.77 blue:0.74 alpha:1.0
 	-- NSTextAlignmentCenter is 1 on Apple Silicon and 2 on Intel Macs
 	if (do shell script "/usr/bin/uname -m") is "x86_64" then
 		set my centerValue to 2
@@ -2023,10 +2206,10 @@ end stackViews
 -- File names, one per line; in a scroll view of the same width when too tall
 on namesView(fileNames, textWidth, maxHeight)
 	set ca to current application
-	set field to my lineLabel(fileNames, true, 15, my yellowColor, textWidth)
+	set field to my lineLabel(fileNames, true, 15, my nameColor, textWidth)
 	set h to my lastHeight
 	if h &lt;= maxHeight then return {field, h}
-	set field to my lineLabel(fileNames, true, 15, my yellowColor, textWidth - 20)
+	set field to my lineLabel(fileNames, true, 15, my nameColor, textWidth - 20)
 	set h to my lastHeight
 	set content to ca's NSView's alloc()'s initWithFrame:{{0, 0}, {textWidth - 20, h}}
 	content's addSubview:field
@@ -2210,7 +2393,7 @@ for (( n = 1; n &lt;= ${#files}; n++ )); do
   fi
 done
 # files already started are finished even after Cancel: none is left half written
-wait ${pids[@]} 2&gt;/dev/null
+wait_all ${pids[@]}
 progress_stop
 
 # --- 4. Summary ------------------------------------------------------------------

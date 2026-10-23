@@ -20,26 +20,10 @@ A small collection of macOS Finder Quick Actions for music producers and sound d
 
 ## Requirements
 
-- macOS (tested on macOS 14 Sonoma, Apple Silicon and Intel)
-- [Homebrew](https://brew.sh), then in Terminal:
+- **macOS 13 Ventura or later** (tested on macOS 14 Sonoma)
+- **Nothing to install**: the Quick Actions only use tools built into macOS. The audio is decoded and encoded by macOS itself (`afconvert`), the measurements, the analyses and the neural network of Find Key run in JavaScriptCore, the JavaScript engine of macOS, and the tags are read and written in Perl.
 
-  ```bash
-  brew install sox_ng ffmpeg numpy
-  ```
-
-| | `sox_ng` | `ffmpeg` | `numpy` |
-|---|---|---|---|
-| Normalize Peak | WAV, AIFF, CAF | FLAC only | — |
-| Normalize Loudness | WAV, AIFF, CAF | always (measurement and FLAC) | — |
-| Analyze Loudness | — | always | — |
-| Find Mono | — | always | — |
-| Make Cover | — | always | — |
-| Find Key | — | always | always |
-| Clean Logic Samples | — | — | — |
-
-The classic `sox` formula works too. `numpy` (with the Python that comes with it) is only needed by Find Key. Clean Logic Samples needs neither sox nor ffmpeg: it only uses tools built into macOS.
-
-**First run:** the first time a Quick Action works on files in your Downloads, Desktop or Documents folder, or on an external drive, macOS may ask whether *ffmpeg*, *ffprobe* or *sox* can access them. Click **Allow** for each one. If you clicked *Don't Allow*, go to **System Settings › Privacy & Security › Files and Folders**, find the tool and turn the folder or **Removable Volumes** back on. macOS may ask again after a Homebrew update.
+If you installed `sox`, `ffmpeg` or `numpy` with Homebrew for an earlier version of these Quick Actions, they are no longer needed.
 
 ## Download & installation
 
@@ -159,16 +143,17 @@ Measures the loudness of your audio files and shows what each streaming platform
 
 ### Features
 
-- **Any audio format** ffmpeg can read: WAV, AIFF, CAF, FLAC, ALAC, MP3, AAC/M4A…
-- **Files or folders**: right-click a folder and every WAV, AIFF, CAF, FLAC, MP3, AAC/M4A, Ogg and Opus file in it is measured, subfolders included
+- **Any audio format** macOS can read: WAV, AIFF, CAF, FLAC, ALAC, MP3, AAC/M4A…
+- **Files or folders**: right-click a folder and every WAV, AIFF, CAF, FLAC, MP3 and AAC/M4A file in it is measured, subfolders included
 - **Integrated loudness** (LUFS) and **true peak** (dBTP), with the ITU-R BS.1770 / EBU R128 method
-- **Platform menu**: the gain Spotify (Normal, Loud, Quiet), YouTube, Apple Music, Tidal, Amazon Music, Deezer, SoundCloud or a broadcast EBU R128 delivery would apply to each file, track by track, with notes such as *not turned up*, *limited by true peak* or *limiter*
+- **Platform menu**: the gain Spotify (Normal, Loud, Quiet), YouTube, Apple Music, Tidal, Amazon Music, Deezer, SoundCloud or a broadcast EBU R128 delivery would apply to each file, track by track, with notes such as *not turned up* or *using a limiter*
 - **Several files at once**: the results are listed under each file name, and one menu switches the platform for all of them
 - **Copy to Clipboard**: file name, loudness, true peak and the result for the selected platform
 
 ### Good to know
 
-Spotify's targets and rules come from its official documentation. The other platforms' values are the ones commonly reported; they are not always officially published and may change.
+- **Using a limiter**: when a quiet file would go past -1 dBTP on its way up to a platform's target, the whole gain it still needs is shown with *(using a limiter)*: how much loudness is left to gain with a limiter. Nothing is modified.
+- Spotify's targets and rules come from its official documentation. The other platforms' values are the ones commonly reported; they are not always officially published and may change.
 
 [`Analyze Loudness/analyze-loudness.sh`](Analyze%20Loudness/analyze-loudness.sh) is a readable copy of the script embedded in the workflow.
 
@@ -179,7 +164,7 @@ Spotify's targets and rules come from its official documentation. The other plat
 Sample packs and old projects are full of stereo files that are really mono: twice the size, for nothing. Find Mono finds them and can turn them into real mono files, without changing a single sample of the audio.
 
 <p align="center">
-  <img src="Docs/find-mono-screenshot.png" width="720" alt="Find Mono window next to the selected files in the Finder">
+  <img src="Docs/find-mono-screenshot.png" width="480" alt="Find Mono window">
 </p>
 
 ### What it finds
@@ -231,17 +216,18 @@ Gives every track its own cover, drawn from its own sound: the loudness of the w
 - **Title and artist**: suggested from the file's tags, or from its name (`Artist - Title`), and editable. Untick **Show text** for a cover without text
 - **Live preview**: the cover is redrawn as you change the style, the colors or the text
 - **Several files at once**: each file gets its own cover; use ◀ ▶ to go through them and adjust each title and artist
-- **Files or folders**: right-click a folder (an album, a playlist…) and every AIFF, WAV, FLAC, MP3 and M4A file in it gets its own cover, subfolders included
+- **Files or folders**: right-click a folder (an album, a playlist…) and every AIFF, WAV, FLAC and MP3 file in it gets its own cover, subfolders included
 - **Add Cover**: the cover is embedded in the file and replaces the existing one, if any. The audio is never touched: every file is checked against the original before it is replaced
 - **Save Image**: saves the cover next to the audio file instead, as `<file name> - Cover.jpg`
 - **3000 × 3000 px JPEG**, the size most distributors ask for
-- **Formats**: AIFF / AIF / AIFC, WAV, FLAC, MP3 and M4A (AAC and ALAC)
+- **Formats**: AIFF / AIF / AIFC, WAV, FLAC and MP3
 
 ### Good to know
 
 - **AIFF and WAV**: the cover goes in the file's ID3 tag. Every other chunk and every other tag (Apple Loops information, markers…) is kept byte for byte.
-- **FLAC, MP3 and M4A**: the file is rewritten by ffmpeg without re-encoding (stream copy), with its tags. MP3 files without an encoder *Info* header are kept without one, so they play exactly as before.
-- **Where covers show up**: AIFF, MP3 and M4A covers appear in the Finder, Music and most DJ software. WAV and FLAC covers are read by DJ software and many players, but the Finder doesn't show them (a macOS limitation).
+- **MP3**: the cover goes in the ID3v2 tag; the audio frames and every other tag are copied byte for byte.
+- **FLAC**: the cover goes in the PICTURE block; the audio frames and every other block (tags…) are copied byte for byte.
+- **Where covers show up**: AIFF and MP3 covers appear in the Finder, Music and most DJ software. WAV and FLAC covers are read by DJ software and many players, but the Finder doesn't show them (a macOS limitation).
 
 [`Make Cover/make-cover.sh`](Make%20Cover/make-cover.sh) is a readable copy of the script embedded in the workflow.
 
@@ -251,13 +237,17 @@ Gives every track its own cover, drawn from its own sound: the loudness of the w
 
 Finds the musical key of your tracks, samples and loops, with a neural network trained on electronic and dance music, then writes it where your DJ software and your file browser can see it.
 
+<p align="center">
+  <img src="Docs/find-key-screenshot.png" width="480" alt="Find Key window">
+</p>
+
 ### Features
 
-- **A neural network**: Find Key uses [MusicalKeyCNN](https://github.com/a1ex90/MusicalKeyCNN), a convolutional network after Korzeniowski & Widmer (*Genre-Agnostic Key Classification with Convolutional Neural Networks*, ISMIR 2018), trained on the GiantSteps key dataset. Its pipeline is rewritten with numpy only, and gives exactly the same keys as the original
+- **A neural network**: Find Key uses [MusicalKeyCNN](https://github.com/a1ex90/MusicalKeyCNN), a convolutional network after Korzeniowski & Widmer (*Genre-Agnostic Key Classification with Convolutional Neural Networks*, ISMIR 2018), trained on the GiantSteps key dataset. Its pipeline is rewritten in JavaScript and runs in macOS itself; it gives exactly the same keys as the original
 - **The whole track is analyzed**; short loops and samples are repeated first, so even a two-second loop gets a key
 - **A second opinion**: under each key, the next most likely one, such as *Could be A minor (14%)*
 - **Files or folders**: right-click a folder and every WAV, AIFF, FLAC and MP3 file in it is analyzed, subfolders included
-- **Add Key to Metadata**: the key goes into each file's tags, where Rekordbox, Traktor, Serato and Music read it (`Am`, `F#m`, `Eb`…): the ID3 tag of AIFF, WAV and MP3 files, the Vorbis comment of FLAC files. The audio itself is not modified: every file is checked against the original before it is replaced, and every other chunk and tag is kept
+- **Add Key to Metadata**: the key goes into each file's tags, where Rekordbox, Traktor, Serato and Music read it (`Am`, `F#m`, `Eb`…): the ID3 tag of AIFF, WAV and MP3 files, the Vorbis comment of FLAC files. The audio itself is not modified: it is copied byte for byte and checked against the original before the file is replaced, and every other chunk and tag is kept
 - **Add Key to Filename**: the key goes at the start of each file name: `[F Minor] Kid Creme - At Night.wav`. A key already there is replaced, not added twice
 - **Copy to Clipboard**: the file names and their keys
 
@@ -265,8 +255,7 @@ Finds the musical key of your tracks, samples and loops, with a neural network t
 
 - **How good is it?** On the GiantSteps test set, MusicalKeyCNN reaches a weighted score of 73.5. In a [2025 community comparison on r/DJs](https://www.reddit.com/r/DJs/comments/1ms1yds/key_detection_comparison_2025/), it found the right key for 79.4% of the tracks, behind Mixed In Key (85.2%) but ahead of Rekordbox (72.2%). No key detector is always right: trust your ears for the tracks that matter.
 - **The percentage is modest by nature**: the model spreads its probabilities over 24 keys, so even a right answer rarely shows a high figure. What counts is which key comes first.
-- **The model is inside the Quick Action** (`Find Key.workflow/Contents/Resources/keynet.npz`, 1.7 MB): nothing is sent anywhere, everything runs on your Mac.
-- **Requires** `ffmpeg` and `numpy`: `brew install ffmpeg numpy`.
+- **The model is inside the Quick Action** (`Find Key.workflow/Contents/Resources/keynet.bin`, 2.9 MB): nothing is sent anywhere, everything runs on your Mac.
 
 [`Find Key/find-key.sh`](Find%20Key/find-key.sh) is a readable copy of the script embedded in the workflow.
 

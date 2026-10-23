@@ -66,191 +66,354 @@
 #   MIT License, (c) 2025 Alexander Sommer): a convolutional neural network after
 #   Korzeniowski &amp; Widmer, "Genre-Agnostic Key Classification with Convolutional
 #   Neural Networks" (ISMIR 2018), trained on the GiantSteps-MTG key dataset.
-#   Its pipeline (constant-Q spectrogram + network) is rewritten here with numpy
-#   only; it gives the same keys as the original (PyTorch + librosa).
 # - The whole track is analyzed (a short loop is repeated first). The second most
 #   likely key is shown too, with its probability.
 # - Files and folders: a folder is searched with all its subfolders.
-# - Add Key to Metadata: the key goes into the file's tags, the audio is not touched (checked
-#   before the file is replaced):
+#
+# Needs nothing to be installed, everything is done by macOS itself:
+# - the audio is decoded by afconvert (built into macOS) to 32-bit float at 44.1 kHz;
+# - the constant-Q spectrogram and the network run in JavaScript, in jsc, the
+#   JavaScriptCore engine that comes with macOS (with its fast compiler); the CQT
+#   kernels and the weights are stored in keynet.bin, in the workflow bundle;
+# - Add Key to Metadata is done in Perl (built into macOS) for every format:
 #     AIFF, WAV: TKEY frame of the ID3 chunk; every other chunk is kept byte for byte
-#     MP3: TKEY (ID3v2), FLAC: INITIALKEY (Vorbis comment); rewritten by ffmpeg
-#     without re-encoding, keeping the tags and the cover
-# - Add Key to Filename: the key goes at the start of the file name: "[F Minor] Title.wav"
-#   (a key already there is replaced).
+#     MP3: TKEY frame of the ID3v2 tag; FLAC: INITIALKEY in the Vorbis comment;
+#     the audio frames and every other tag are copied byte for byte
+#   and macOS checks that the audio is identical before the file is replaced.
+# - Add Key to Filename: "[F Minor] Title.wav" (a key already there is replaced).
 # - Copy to Clipboard: file names and keys.
 #
-# Requires ffmpeg and numpy (brew install ffmpeg numpy). Runs with /bin/zsh.
-
+# Requires nothing but macOS. Runs with /bin/zsh.
 
 export LC_NUMERIC=C
 
-FFMPEG="" PYTHON=""
-for p in /opt/homebrew/bin/ffmpeg /usr/local/bin/ffmpeg; do
-  [[ -x $p ]] &amp;&amp; { FFMPEG=$p; break; }
-done
-for p in /opt/homebrew/bin/python3 /usr/local/bin/python3; do
-  [[ -x $p ]] &amp;&amp; "$p" -c 'import numpy' 2&gt;/dev/null &amp;&amp; { PYTHON=$p; break; }
-done
+# jsc, the JavaScript engine built into macOS (JavaScriptCore). Its readFile function
+# reads the audio; it is checked before anything is done.
+JSC=/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc
 
-# The model (MusicalKeyCNN weights, checkpoints/keynet.pt, with the batch
-# normalisation folded into the convolutions, as a numpy archive) is stored in the
-# workflow bundle: it is too large to be part of the script itself.
+# The model (MusicalKeyCNN weights, with the batch normalisation folded into the
+# convolutions, and the precomputed CQT kernels) is stored in the workflow bundle.
 weights=""
 for p in "$HOME/Library/Services/Find Key.workflow" "/Library/Services/Find Key.workflow"; do
-  [[ -f $p/Contents/Resources/keynet.npz ]] &amp;&amp; { weights="$p/Contents/Resources/keynet.npz"; break; }
+  [[ -f $p/Contents/Resources/keynet.bin ]] &amp;&amp; { weights="$p/Contents/Resources/keynet.bin"; break; }
 done
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/findkey.XXXXXX") || exit 1
 trap '[[ -n $progress_pid ]] &amp;&amp; kill $progress_pid 2&gt;/dev/null; rm -rf "$tmpdir"' EXIT
-py="$tmpdir/findkey.py" pl="$tmpdir/id3key.pl"
 
-cat &gt; "$py" &lt;&lt;'PYTHON'
-# Find Key: musical key of audio files, with the MusicalKeyCNN model
-# (github.com/a1ex90/MusicalKeyCNN, MIT License, (c) 2025 Alexander Sommer),
-# a convolutional network after Korzeniowski &amp; Widmer, "Genre-Agnostic Key
-# Classification with Convolutional Neural Networks" (ISMIR 2018).
-#
-# Same pipeline as the original (librosa CQT + PyTorch), rewritten with numpy only:
-# mono 44.1 kHz audio -&gt; constant-Q spectrogram (105 bins, 24 per octave from 65 Hz,
-# one frame every 0.2 s) -&gt; log(1 + x) -&gt; network -&gt; one of 24 keys.
-#
-#   python3 findkey.py WEIGHTS.npz FFMPEG FILE...
-# prints one line per file: number TAB key class (0-23) TAB probability TAB second
-# class TAB its probability, or number TAB "err"
-import sys
-import subprocess
-import numpy as np
-from concurrent.futures import ThreadPoolExecutor
+# Waits for every job given. (zsh's "wait pid1 pid2..." returns as soon as one of the
+# jobs has ended with an error, without waiting for the others.)
+wait_all() { local p; for p in "$@"; do wait $p 2&gt;/dev/null; done }
+js="$tmpdir/fkjsc.js" pl="$tmpdir/id3key.pl"
+# jsc reads the paths it is given as ISO Latin 1: the model is given to it through a
+# link with a plain name (the account name in its path could have an accent)
+[[ -n $weights ]] &amp;&amp; ln -s "$weights" "$tmpdir/keynet.bin" &amp;&amp; weights="$tmpdir/keynet.bin"
 
-SR, HOP, NB, BPO, FMIN = 44100, 8820, 105, 24, 65.0
+cat &gt; "$js" &lt;&lt;'JAVASCRIPT'
+// Find Key engine in JavaScript: the MusicalKeyCNN model
+// (github.com/a1ex90/MusicalKeyCNN, MIT License, (c) 2025 Alexander Sommer),
+// same pipeline as findkey.py (numpy), with no library at all.
+//
+// mono 44.1 kHz audio -&gt; constant-Q spectrogram (105 bins, 24 per octave from 65 Hz,
+// one frame every 0.2 s) -&gt; log(1 + x) -&gt; network (9 convolutions) -&gt; one of 24 keys.
+// The CQT kernels are precomputed (exactly as findkey.py builds them) and stored
+// with the network weights in keynet.bin.
+
+var SR = 44100, HOP = 8820;
+
+// --- keynet.bin -----------------------------------------------------------------------
+// "FKJ1", N_FFT, number of bins, number of kernel entries (int32), then float32:
+// w1 b1 ... w9 b9, int32 counts per bin, int32 positions, float32 re/im pairs,
+// float32 scale per bin
+var SHAPES = [[20, 1, 5], [20, 20, 3], [40, 20, 3], [40, 40, 3], [80, 40, 3],
+              [80, 80, 3], [160, 80, 3], [160, 160, 3], [24, 160, 1]];
+
+function loadModel(buf) {          // buf: ArrayBuffer
+  var dv = new DataView(buf), off = 4;
+  var nfft = dv.getInt32(off, true), nb = dv.getInt32(off + 4, true), ne = dv.getInt32(off + 8, true);
+  off += 12;
+  function f32(n) { var a = new Float32Array(n); for (var i = 0; i &lt; n; i++) a[i] = dv.getFloat32(off + 4 * i, true); off += 4 * n; return a; }
+  function i32(n) { var a = new Int32Array(n); for (var i = 0; i &lt; n; i++) a[i] = dv.getInt32(off + 4 * i, true); off += 4 * n; return a; }
+  var layers = [];
+  for (var l = 0; l &lt; 9; l++) {
+    var s = SHAPES[l];
+    var w = f32(s[0] * s[1] * s[2] * s[2]), b = f32(s[0]);
+    layers.push({ O: s[0], C: s[1], k: s[2], w: w, b: b });
+  }
+  var counts = i32(nb), pos = i32(ne), reim = f32(2 * ne), scale = f32(nb);
+  var maxPos = 0;
+  for (var j = 0; j &lt; ne; j++) if (pos[j] &gt; maxPos) maxPos = pos[j];
+  return { nfft: nfft, nb: nb, layers: layers, counts: counts, pos: pos, reim: reim,
+           scale: scale, maxPos: maxPos, fft: makeFFT(nfft / 2) };
+}
+
+// --- FFT ----------------------------------------------------------------------------
+function makeFFT(M) {               // complex FFT of size M (power of 2)
+  var bits = Math.round(Math.log(M) / Math.LN2), rev = new Int32Array(M);
+  for (var i = 0; i &lt; M; i++) {
+    var r = 0, x = i;
+    for (var b = 0; b &lt; bits; b++) { r = (r &lt;&lt; 1) | (x &amp; 1); x &gt;&gt;= 1; }
+    rev[i] = r;
+  }
+  var cosT = new Float64Array(M / 2), sinT = new Float64Array(M / 2);
+  for (var k = 0; k &lt; M / 2; k++) { cosT[k] = Math.cos(2 * Math.PI * k / M); sinT[k] = -Math.sin(2 * Math.PI * k / M); }
+  // twiddles of the real-FFT split (size N = 2M)
+  var N = 2 * M, cN = new Float64Array(M + 1), sN = new Float64Array(M + 1);
+  for (var k2 = 0; k2 &lt;= M; k2++) { cN[k2] = Math.cos(2 * Math.PI * k2 / N); sN[k2] = -Math.sin(2 * Math.PI * k2 / N); }
+  return { M: M, rev: rev, cosT: cosT, sinT: sinT, cN: cN, sN: sN,
+           re: new Float64Array(M), im: new Float64Array(M) };
+}
+
+function fftInPlace(F) {
+  var M = F.M, re = F.re, im = F.im, rev = F.rev, i, j, t;
+  for (i = 0; i &lt; M; i++) {
+    j = rev[i];
+    if (j &gt; i) { t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+  }
+  for (var size = 2; size &lt;= M; size &lt;&lt;= 1) {
+    var half = size &gt;&gt; 1, step = M / size;
+    for (var start = 0; start &lt; M; start += size) {
+      for (var k = 0, tw = 0; k &lt; half; k++, tw += step) {
+        var a = start + k, b = a + half;
+        var wr = F.cosT[tw], wi = F.sinT[tw];
+        var xr = re[b] * wr - im[b] * wi, xi = re[b] * wi + im[b] * wr;
+        re[b] = re[a] - xr; im[b] = im[a] - xi;
+        re[a] += xr; im[a] += xi;
+      }
+    }
+  }
+}
+
+// rfft of the real frame (length N = 2M) starting at "start" in y (zeros outside),
+// bins 0..kmax into Xr, Xi
+function rfftFrame(F, y, start, kmax, Xr, Xi) {
+  var M = F.M, re = F.re, im = F.im, n = y.length;
+  for (var i = 0; i &lt; M; i++) {
+    var p = start + 2 * i;
+    re[i] = (p &gt;= 0 &amp;&amp; p &lt; n) ? y[p] : 0;
+    im[i] = (p + 1 &gt;= 0 &amp;&amp; p + 1 &lt; n) ? y[p + 1] : 0;
+  }
+  fftInPlace(F);
+  for (var k = 0; k &lt;= kmax; k++) {
+    var k2 = (M - k) % M;
+    var ar = re[k], ai = im[k], br = re[k2], bi = -im[k2];       // Z[k], conj(Z[M-k])
+    var er = (ar + br) / 2, ei = (ai + bi) / 2;                  // even part
+    var dr = ar - br, di = ai - bi;                              // (Z[k] - conj(Z[M-k]))
+    var or_ = di / 2, oi = -dr / 2;                              // divided by 2i
+    var c = F.cN[k], s = F.sN[k];
+    Xr[k] = er + (or_ * c - oi * s);
+    Xi[k] = ei + (or_ * s + oi * c);
+  }
+}
+
+// --- Spectrogram ----------------------------------------------------------------------
+function spectrogram(m, y) {        // y: Float32Array (mono, 44.1 kHz)
+  var N = m.nfft, nb = m.nb, nfr = 1 + Math.floor(y.length / HOP);
+  var T = nfr - 2;                  // the last two frames are dropped, like the original
+  var out = new Float64Array(nb * T);
+  var kmax = m.maxPos, Xr = new Float64Array(kmax + 1), Xi = new Float64Array(kmax + 1);
+  for (var f = 0; f &lt; T; f++) {
+    rfftFrame(m.fft, y, f * HOP - N / 2, kmax, Xr, Xi);
+    var e = 0;
+    for (var k = 0; k &lt; nb; k++) {
+      var sr = 0, si = 0, cnt = m.counts[k];
+      for (var j = 0; j &lt; cnt; j++, e++) {
+        var p = m.pos[e], kr = m.reim[2 * e], ki = m.reim[2 * e + 1];
+        var yr = Xr[p], yi = -Xi[p];                             // conj(rfft)
+        sr += yr * kr - yi * ki; si += yr * ki + yi * kr;
+      }
+      out[k * T + f] = Math.log1p(Math.fround(Math.fround(Math.sqrt(sr * sr + si * si)) * m.scale[k]));
+    }
+  }
+  return { data: out, H: nb, W: T };
+}
+
+// --- Network ---------------------------------------------------------------------------
+function conv(x, C, H, W, L) {      // zero-padded cross-correlation + bias
+  // The input is copied into a zero-padded buffer (width Wp), then the output is built
+  // one row at a time: for each input row and each output channel, k contiguous loops
+  // over the row. The rows being worked on stay in the processor's cache.
+  var O = L.O, k = L.k, p = k &gt;&gt; 1, w = L.w, HW = H * W;
+  var Wp = W + 2 * p, Hp = H + 2 * p, plane = Hp * Wp;
+  var xp = new Float64Array(C * plane);
+  for (var c0 = 0; c0 &lt; C; c0++)
+    for (var yy = 0; yy &lt; H; yy++) {
+      var d = c0 * plane + (yy + p) * Wp + p, s0 = (c0 * H + yy) * W;
+      for (var xx = 0; xx &lt; W; xx++) xp[d + xx] = x[s0 + xx];
+    }
+  var out = new Float64Array(O * HW);
+  for (var y = 0; y &lt; H; y++) {
+    for (var o0 = 0; o0 &lt; O; o0++) {
+      var r0 = o0 * HW + y * W, bias = L.b[o0];
+      for (var i0 = 0; i0 &lt; W; i0++) out[r0 + i0] = bias;
+    }
+    if (k === 3 &amp;&amp; O % 4 === 0) { conv3Row(xp, C, plane, Wp, y, out, O, HW, W, w); continue; }
+    for (var c = 0; c &lt; C; c++) {
+      for (var dy = 0; dy &lt; k; dy++) {
+        var src = c * plane + (y + dy) * Wp;
+        for (var o = 0; o &lt; O; o++) {
+          var row = o * HW + y * W, wb = ((o * C + c) * k + dy) * k;
+          for (var dx = 0; dx &lt; k; dx++) {
+            var wv = w[wb + dx];
+            if (wv === 0) continue;
+            var s1 = src + dx;
+            for (var i = 0; i &lt; W; i++) out[row + i] += wv * xp[s1 + i];
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// 3 x 3 kernels: one output row, four output channels at a time, the three taps of a
+// kernel row at once (fewer reads and writes for the same arithmetic)
+function conv3Row(xp, C, plane, Wp, y, out, O, HW, W, w) {
+  for (var o = 0; o &lt; O; o += 4) {
+    var r0 = o * HW + y * W, r1 = r0 + HW, r2 = r1 + HW, r3 = r2 + HW;
+    for (var c = 0; c &lt; C; c++) {
+      for (var dy = 0; dy &lt; 3; dy++) {
+        var src = c * plane + (y + dy) * Wp;
+        var q0 = ((o * C + c) * 3 + dy) * 3, st = C * 9;
+        var a0 = w[q0], a1 = w[q0 + 1], a2 = w[q0 + 2];
+        var b0 = w[q0 + st], b1 = w[q0 + st + 1], b2 = w[q0 + st + 2];
+        var c0 = w[q0 + 2 * st], c1 = w[q0 + 2 * st + 1], c2 = w[q0 + 2 * st + 2];
+        var d0 = w[q0 + 3 * st], d1 = w[q0 + 3 * st + 1], d2 = w[q0 + 3 * st + 2];
+        var x0 = xp[src], x1 = xp[src + 1];
+        for (var i = 0; i &lt; W; i++) {
+          var x2 = xp[src + i + 2];
+          out[r0 + i] += a0 * x0 + a1 * x1 + a2 * x2;
+          out[r1 + i] += b0 * x0 + b1 * x1 + b2 * x2;
+          out[r2 + i] += c0 * x0 + c1 * x1 + c2 * x2;
+          out[r3 + i] += d0 * x0 + d1 * x1 + d2 * x2;
+          x0 = x1; x1 = x2;
+        }
+      }
+    }
+  }
+}
+
+function elu(a) {
+  for (var i = 0; i &lt; a.length; i++) { var v = a[i]; if (v &lt;= 0) a[i] = Math.expm1(v); }
+  return a;
+}
+
+function pool(x, C, H, W) {
+  var H2 = H &gt;&gt; 1, W2 = W &gt;&gt; 1, out = new Float64Array(C * H2 * W2);
+  for (var c = 0; c &lt; C; c++)
+    for (var yy = 0; yy &lt; H2; yy++)
+      for (var xx = 0; xx &lt; W2; xx++) {
+        var b = c * H * W + 2 * yy * W + 2 * xx;
+        out[(c * H2 + yy) * W2 + xx] = Math.max(x[b], x[b + 1], x[b + W], x[b + W + 1]);
+      }
+  return { data: out, H: H2, W: W2 };
+}
+
+function network(m, spec) {
+  var x = spec.data, C = 1, H = spec.H, W = spec.W;
+  for (var l = 0; l &lt; 9; l++) {
+    var L = m.layers[l];
+    x = elu(conv(x, C, H, W, L));
+    C = L.O;
+    if (l === 1 || l === 3 || l === 5) { var r = pool(x, C, H, W); x = r.data; H = r.H; W = r.W; }
+  }
+  var HW = H * W, logits = new Float64Array(C), mx = -Infinity;
+  for (var c = 0; c &lt; C; c++) {
+    var s = 0;
+    for (var i = 0; i &lt; HW; i++) s += x[c * HW + i];
+    logits[c] = s / HW;
+    if (logits[c] &gt; mx) mx = logits[c];
+  }
+  var sum = 0, prob = new Float64Array(C);
+  for (var c2 = 0; c2 &lt; C; c2++) { prob[c2] = Math.exp(logits[c2] - mx); sum += prob[c2]; }
+  for (var c3 = 0; c3 &lt; C; c3++) prob[c3] /= sum;
+  return prob;
+}
+
+// --- One file ---------------------------------------------------------------------------
+// y: mono 44.1 kHz samples. Returns "a\tpa\tb\tpb" or "err"
+function findKey(m, y) {
+  if (y.length &lt; SR / 2) return 'err';
+  if (y.length &lt; SR * 8) {
+    // a short sound (a loop, a sample) is repeated up to 8 seconds
+    var reps = Math.ceil(SR * 8 / y.length), t = new Float32Array(y.length * reps);
+    for (var r = 0; r &lt; reps; r++) t.set(y, r * y.length);
+    y = t;
+  }
+  var p = network(m, spectrogram(m, y));
+  var a = 0;
+  for (var i = 1; i &lt; p.length; i++) if (p[i] &gt; p[a]) a = i;
+  var b = a === 0 ? 1 : 0;
+  for (var j = 0; j &lt; p.length; j++) if (j !== a &amp;&amp; p[j] &gt; p[b]) b = j;
+  return a + '\t' + p[a].toFixed(3) + '\t' + b + '\t' + p[b].toFixed(3);
+}
 
 
-def make_kernels():
-    """Spectra of the CQT kernels (Hann-windowed complex exponentials, L1-normalised,
-    like librosa's), restricted to the frequency bins where each one lives."""
-    freqs = FMIN * 2.0 ** (np.arange(NB) / BPO)
-    alpha = (2.0 ** (2.0 / BPO) - 1) / (2.0 ** (2.0 / BPO) + 1)
-    lengths = SR / (alpha * freqs)
-    N = int(2 ** np.ceil(np.log2(lengths.max())))
-    kernels = []
-    for f, L in zip(freqs, lengths):
-        ilen = int(L)
-        n = np.arange(-ilen // 2, ilen // 2)
-        sig = np.exp(1j * 2 * np.pi * f / SR * n)
-        sig *= 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(len(sig)) / len(sig))
-        sig /= np.abs(sig).sum()
-        k = np.zeros(N, complex)
-        k[N // 2 + n] = sig
-        # correlation with the kernel = product with the spectrum of its conjugate,
-        # which lives in the negative frequencies; for a real signal those are the
-        # conjugates of the positive ones, so only the rfft is needed
-        K = np.fft.fft(np.conj(k))
-        keep = np.nonzero(np.abs(K) &gt; np.abs(K).max() * 1e-6)[0]
-        pos = (N - keep) % N
-        ok = pos &lt;= N // 2
-        kernels.append((pos[ok], K[keep[ok]].astype(np.complex64)))
-    return N, np.sqrt(lengths), kernels
+// --- macOS side: the jsc command (JavaScriptCore, with its JIT) ---------------------------
+//   jsc fkjsc.js -- MODEL OUT N1 WAV1 N2 WAV2 ...
+// Each WAV is 32-bit float at 44.1 kHz (decoded beforehand by afconvert); its channels
+// are mixed to mono like ffmpeg does (each channel x 0.7071 for stereo). One line per
+// file: "N TAB key TAB probability TAB second key TAB probability", or "N TAB err".
+function readWav(buf) {
+  var dv = new DataView(buf), pos = 12, ch = 0, data = -1, len = 0;
+  while (pos + 8 &lt;= buf.byteLength) {
+    var id = String.fromCharCode(dv.getUint8(pos), dv.getUint8(pos + 1), dv.getUint8(pos + 2), dv.getUint8(pos + 3));
+    var size = dv.getUint32(pos + 4, true);
+    if (id === 'fmt ') ch = dv.getUint16(pos + 10, true);
+    if (id === 'data') { data = pos + 8; len = Math.min(size, buf.byteLength - data); break; }
+    pos += 8 + size + (size &amp; 1);
+  }
+  if (data &lt; 0 || ch &lt; 1) return null;
+  var frames = Math.floor(len / (4 * ch)), y = new Float32Array(frames);
+  var src = (data &amp; 3) ? new Float32Array(buf.slice(data, data + frames * ch * 4)) : new Float32Array(buf, data, frames * ch);
+  var g = ch === 1 ? 1 : ch === 2 ? Math.SQRT1_2 : 1 / ch;
+  for (var i = 0; i &lt; frames; i++) {
+    var s = 0, b = i * ch;
+    for (var c = 0; c &lt; ch; c++) s += src[b + c];
+    y[i] = s * g;
+  }
+  return y;
+}
 
-
-N_FFT, SCALE, KERNELS = make_kernels()
-
-
-def spectrogram(y):
-    nfr = 1 + len(y) // HOP
-    ypad = np.pad(y.astype(np.float32), (N_FFT // 2, N_FFT // 2))
-    out = np.zeros((NB, nfr), np.float32)
-    for s in range(0, nfr, 64):
-        idx = np.arange(s, min(nfr, s + 64))
-        frames = np.stack([ypad[i * HOP:i * HOP + N_FFT] for i in idx])
-        Y = np.conj(np.fft.rfft(frames, axis=1).astype(np.complex64))
-        for k, (pos, K) in enumerate(KERNELS):
-            out[k, idx] = np.abs(Y[:, pos] @ K)
-    out *= (SCALE / N_FFT)[:, None].astype(np.float32)
-    return np.log1p(out)[:, 0:-2]
-
-
-def conv(x, w, b):
-    O, C, k, _ = w.shape
-    if k == 1:
-        return np.tensordot(w[:, :, 0, 0], x, axes=([1], [0])) + b[:, None, None]
-    p = k // 2
-    H, W = x.shape[1], x.shape[2]
-    xp = np.pad(x, ((0, 0), (p, p), (p, p)))
-    out = np.zeros((O, H * W), np.float32)
-    for dy in range(k):
-        for dx in range(k):
-            out += w[:, :, dy, dx] @ xp[:, dy:dy + H, dx:dx + W].reshape(C, H * W)
-    return out.reshape(O, H, W) + b[:, None, None]
-
-
-def elu(x):
-    return np.where(x &gt; 0, x, np.expm1(np.minimum(x, 0))).astype(np.float32)
-
-
-def pool(x):
-    C, H, W = x.shape
-    return x[:, :H // 2 * 2, :W // 2 * 2].reshape(C, H // 2, 2, W // 2, 2).max(axis=(2, 4))
-
-
-def network(spec, P):
-    x = spec[None]
-    for i in (1, 2, 3, 4, 5, 6, 7, 8, 9):
-        x = elu(conv(x, P['w%d' % i], P['b%d' % i]))
-        if i in (2, 4, 6):
-            x = pool(x)
-    logits = x.mean(axis=(1, 2)).astype(np.float64)
-    p = np.exp(logits - logits.max())
-    return p / p.sum()
-
-
-def decode(ffmpeg, path):
-    r = subprocess.run([ffmpeg, '-nostdin', '-v', 'error', '-i', path, '-map', '0:a:0',
-                        '-ac', '1', '-ar', str(SR), '-f', 'f32le', '-'],
-                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    if r.returncode != 0:
-        return None
-    return np.frombuffer(r.stdout, np.float32)
-
-
-def main():
-    weights, ffmpeg, files = sys.argv[1], sys.argv[2], sys.argv[3:]
-    P = {k: v.astype(np.float32) for k, v in np.load(weights).items()}
-
-    def job(item):
-        n, path = item
-        try:
-            y = decode(ffmpeg, path)
-            if y is None or len(y) &lt; SR // 2:
-                return '%d\terr' % n
-            if len(y) &lt; SR * 8:
-                # a short sound (a loop, a sample) is repeated up to 8 seconds: the
-                # network needs a few seconds of spectrogram
-                y = np.tile(y, int(np.ceil(SR * 8 / len(y))))
-            p = network(spectrogram(y), P)
-            a, b = np.argsort(p)[::-1][:2]
-            return '%d\t%d\t%.3f\t%d\t%.3f' % (n, a, p[a], b, p[b])
-        except Exception:
-            return '%d\terr' % n
-
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        for line in ex.map(job, enumerate(files, 1)):
-            print(line, flush=True)
-
-
-if __name__ == '__main__':
-    main()
-PYTHON
+function main(args) {
+  var mb = readFile(args[0], 'binary');
+  var model = loadModel(mb.buffer.slice(mb.byteOffset, mb.byteOffset + mb.byteLength));
+  for (var a = 1; a + 1 &lt; args.length; a += 2) {
+    var line;
+    try {
+      var u = readFile(args[a + 1], 'binary');
+      // the samples start at a 4-byte boundary in afconvert's WAV files: copy to be sure
+      var buf = u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength);
+      var y = readWav(buf);
+      line = y ? findKey(model, y) : 'err';
+    } catch (e) {
+      line = 'err';
+    }
+    print(args[a] + '\t' + line);
+  }
+}
+main(arguments);
+JAVASCRIPT
 
 cat &gt; "$pl" &lt;&lt;'PERL'
 use strict; use warnings;
-# Writes the key in the ID3 chunk of an AIFF or WAV file:
-#   perl id3key.pl SRC DST KEY
-# DST = SRC with KEY in the TKEY frame of its first "ID3 " (AIFF) / "id3 " (WAV)
-# chunk, which is added if there is none. Every other chunk and every other ID3
-# frame is kept byte for byte; key frames in other ID3 chunks are removed.
-my ($src, $dst, $key) = @ARGV;
-my $r = eval { set_key($src, $dst, $key); 1 };
+# Writes the key in the tags of an audio file:
+#   perl id3key.pl SRC DST KEY [aiff|wav|mp3|flac]
+# AIFF, WAV: DST = SRC with KEY in the TKEY frame of its first "ID3 " (AIFF) /
+#   "id3 " (WAV) chunk, which is added if there is none. Every other chunk and every
+#   other ID3 frame is kept byte for byte; key frames in other ID3 chunks are removed.
+# MP3: the ID3v2 tag at the start of the file gets the TKEY frame (a tag is added if
+#   there is none); the rest of the file (audio, ID3v1 tag) is copied byte for byte.
+# FLAC: the Vorbis comment gets INITIALKEY=KEY (any previous INITIALKEY is removed;
+#   a comment block is added if there is none); every other metadata block and the
+#   audio frames are copied byte for byte.
+my ($src, $dst, $key, $kind) = @ARGV;
+$kind //= '';
+my $r = eval {
+    if ($kind eq 'mp3') { mp3_key($src, $dst, $key) }
+    elsif ($kind eq 'flac') { flac_key($src, $dst, $key) }
+    else { set_key($src, $dst, $key) }
+    1 };
 unless ($r) { unlink $dst; print STDERR $@; exit 1 }
 exit 0;
 
@@ -352,6 +515,83 @@ sub set_key {
     }
     my $total = tell($OUT);
     seek($OUT, 4, 0); wr(pack($L, $total - 8));
+    close($OUT) or die "write\n";
+    close($IN);
+}
+# Size of an ID3v2 tag that starts a file (0 if there is none), footer included
+sub id3_size {
+    my ($h, $size) = @_;
+    return 0 unless length($h) == 10 &amp;&amp; substr($h, 0, 3) eq 'ID3';
+    my $len = 10 + unsyncsafe(substr($h, 6, 4));
+    $len += 10 if ord(substr($h, 3, 1)) == 4 &amp;&amp; (ord(substr($h, 5, 1)) &amp; 0x10);
+    die "id3 size\n" if $len &gt; $size;
+    return $len;
+}
+
+sub mp3_key {
+    my ($src, $dst, $key) = @_;
+    open($IN, '&lt;:raw', $src) or die "open\n";
+    open($OUT, '&gt;:raw', $dst) or die "create\n";
+    my $size = -s $IN;
+    my $start = id3_size(rd(0, 10), $size);
+    wr(id3_with_key($start ? rd(0, $start) : undef, $key));
+    copy_range($start, $size - $start);
+    close($OUT) or die "write\n";
+    close($IN);
+}
+
+sub flac_key {
+    my ($src, $dst, $key) = @_;
+    open($IN, '&lt;:raw', $src) or die "open\n";
+    open($OUT, '&gt;:raw', $dst) or die "create\n";
+    my $size = -s $IN;
+    my $pos = id3_size(rd(0, 10), $size);      # an ID3 tag before the FLAC data: kept
+    wr(rd(0, $pos)) if $pos;
+    die "not flac\n" unless rd($pos, 4) eq 'fLaC';
+    wr('fLaC');
+    $pos += 4;
+    my (@blocks, $last);
+    do {
+        my $bh = rd($pos, 4);
+        die "truncated\n" unless length($bh) == 4;
+        my $b0 = ord(substr($bh, 0, 1));
+        $last = $b0 &amp; 0x80;
+        my $len = unpack('N', "\0" . substr($bh, 1, 3));
+        die "truncated\n" if $pos + 4 + $len &gt; $size;
+        push @blocks, { type =&gt; $b0 &amp; 0x7F, pos =&gt; $pos + 4, len =&gt; $len };
+        $pos += 4 + $len;
+    } until $last;
+    my ($vc) = grep { $_-&gt;{type} == 4 } @blocks;
+    my ($vendor, @entries) = ('Find Key');
+    if ($vc) {
+        my $d = rd($vc-&gt;{pos}, $vc-&gt;{len});
+        my $vl = unpack('V', substr($d, 0, 4));
+        $vendor = substr($d, 4, $vl);
+        my $p = 4 + $vl;
+        my $count = unpack('V', substr($d, $p, 4));
+        $p += 4;
+        for (1 .. $count) {
+            my $l = unpack('V', substr($d, $p, 4));
+            die "comment\n" if $p + 4 + $l &gt; length $d;
+            push @entries, substr($d, $p + 4, $l);
+            $p += 4 + $l;
+        }
+    } else {
+        $vc = { type =&gt; 4 };
+        splice(@blocks, 1, 0, $vc);              # right after STREAMINFO
+    }
+    @entries = grep { !/^INITIALKEY=/i } @entries;
+    push @entries, "INITIALKEY=$key";
+    $vc-&gt;{data} = pack('V', length $vendor) . $vendor . pack('V', scalar @entries)
+                . join('', map { pack('V', length $_) . $_ } @entries);
+    die "comment too large\n" if length($vc-&gt;{data}) &gt; 0xFFFFFF;
+    for my $i (0 .. $#blocks) {
+        my $b = $blocks[$i];
+        my $len = defined $b-&gt;{data} ? length $b-&gt;{data} : $b-&gt;{len};
+        wr(chr(($i == $#blocks ? 0x80 : 0) | $b-&gt;{type}) . substr(pack('N', $len), 1, 3));
+        if (defined $b-&gt;{data}) { wr($b-&gt;{data}) } else { copy_range($b-&gt;{pos}, $b-&gt;{len}) }
+    }
+    copy_range($pos, $size - $pos);
     close($OUT) or die "write\n";
     close($IN);
 }
@@ -1741,6 +1981,7 @@ notify() {
     -e 'end run' "$1" "$2" &gt;/dev/null 2&gt;&amp;1
 }
 alert() {
+  progress_stop 2&gt;/dev/null
   /usr/bin/osascript -e 'on run argv' \
     -e 'display alert (item 1 of argv) message (item 2 of argv) as warning' \
     -e 'end run' "$1" "$2" &gt;/dev/null 2&gt;&amp;1
@@ -1749,16 +1990,12 @@ plural() {   # plural 3 file -&gt; "3 files"
   if (( $1 == 1 )); then print -r -- "$1 $2"; else print -r -- "$1 $2s"; fi
 }
 
-if [[ -z $FFMPEG ]]; then
-  alert "ffmpeg not found" "Find Key needs ffmpeg. Install it with Homebrew: brew install ffmpeg"
+if [[ ! -x $JSC || $("$JSC" -e 'print(typeof readFile)' 2&gt;/dev/null) != function ]]; then
+  alert "macOS 13 or later needed" "Find Key needs macOS 13 Ventura or later: it uses jsc, the JavaScript engine built into macOS, which is missing or too old on this Mac."
   exit 0
 fi
 if [[ -z $weights ]]; then
-  alert "Model not found" "The key detection model (keynet.npz) is missing from Find Key.workflow. Install the Quick Action again from its .workflow file."
-  exit 0
-fi
-if [[ -z $PYTHON ]]; then
-  alert "numpy not found" "Find Key needs Python with numpy. Install it with Homebrew: brew install numpy"
+  alert "Model not found" "The key detection model (keynet.bin) is missing from Find Key.workflow. Install the Quick Action again from its .workflow file."
   exit 0
 fi
 
@@ -1772,26 +2009,31 @@ longnames=("Ab minor" "Eb minor" "Bb minor" "F minor" "C minor" "G minor" "D min
 # --- 1. Files -----------------------------------------------------------------------
 # Folders are searched with all their subfolders; hidden files are skipped.
 files=() labels=() kinds=() folders=0
-kind_of() {
+# The kind of a file, in REPLY (empty if not supported). It is set, not printed: a
+# subshell per file would be slow on folders of thousands of files.
+kind_of() {   # file
   case ${(L)1:e} in
-    aif|aiff|aifc) print aiff ;;
-    wav)           print wav ;;
-    flac)          print flac ;;
-    mp3)           print mp3 ;;
+    aif|aiff|aifc) REPLY=aiff ;;
+    wav)           REPLY=wav ;;
+    flac)          REPLY=flac ;;
+    mp3)           REPLY=mp3 ;;
+    *)             REPLY="" ;;
   esac
 }
 add_folder() {   # folder
   setopt localoptions extendedglob
   local d=${1%/} g
   for g in $d/**/*.(#i)(wav|aif|aiff|aifc|flac|mp3)(N.n); do
-    files+=("$g"); labels+=("${g#$d/}"); kinds+=("$(kind_of "$g")")
+    kind_of "$g"
+    files+=("$g"); labels+=("${g#$d/}"); kinds+=("$REPLY")
   done
 }
 for f in "$@"; do
   if [[ -d $f ]]; then
     (( folders++ )); add_folder "$f"
-  elif [[ -f $f &amp;&amp; -n $(kind_of "$f") ]]; then
-    files+=("$f"); labels+=("${f:t}"); kinds+=("$(kind_of "$f")")
+  elif [[ -f $f ]]; then
+    kind_of "$f"
+    [[ -n $REPLY ]] &amp;&amp; { files+=("$f"); labels+=("${f:t}"); kinds+=("$REPLY") }
   fi
 done
 if (( ${#files} == 0 )); then
@@ -1800,28 +2042,77 @@ if (( ${#files} == 0 )); then
 fi
 
 # --- 2. Keys --------------------------------------------------------------------------
-# The engine prints one line per file as it goes: the progress window follows it,
-# and Cancel stops it.
+# macOS decodes each file (afconvert, 32-bit float at 44.1 kHz) and its JavaScript
+# engine (jsc) finds the key. Up to 4 workers run at once; each one takes every 4th
+# file, decodes a few of them, analyzes them, and writes one line per file as it goes:
+# the progress window follows the lines, and Cancel stops the workers.
+nworkers=$(/usr/sbin/sysctl -n hw.ncpu 2&gt;/dev/null)
+[[ $nworkers == &lt;-&gt; ]] || nworkers=4
+(( nworkers &gt; 4 )) &amp;&amp; nworkers=4
+(( nworkers &gt; ${#files} )) &amp;&amp; nworkers=${#files}
+decode() {   # file wav
+  /usr/bin/afconvert -f WAVE -d LEF32@44100 "$1" "$2" 2&gt;/dev/null &amp;&amp; return 0
+  # a FLAC file with an ID3 tag in front of it (not standard): decoded without the tag
+  [[ $(head -c 3 "$1") == ID3 ]] || return 1
+  local skip ok=1
+  skip=$(/usr/bin/perl -e 'open(F, "&lt;:raw", $ARGV[0]) or exit; read(F, my $h, 10) == 10 or exit;
+    my @b = unpack("C4", substr($h, 6, 4)); my $n = 10 + (($b[0] &lt;&lt; 21) | ($b[1] &lt;&lt; 14) | ($b[2] &lt;&lt; 7) | $b[3]);
+    $n += 10 if ord(substr($h, 3, 1)) == 4 &amp;&amp; (ord(substr($h, 5, 1)) &amp; 0x10); print $n' "$1")
+  if [[ $skip == &lt;-&gt; ]] &amp;&amp; tail -c +$(( skip + 1 )) "$1" &gt; "$2.${1:e}"; then
+    /usr/bin/afconvert -f WAVE -d LEF32@44100 "$2.${1:e}" "$2" 2&gt;/dev/null &amp;&amp; ok=0
+  fi
+  rm -f "$2.${1:e}"
+  return $ok
+}
+worker() {   # w: files w, w + nworkers, w + 2 * nworkers... four at a time
+  local w=$1 i j wav out="$tmpdir/k$w.txt"
+  local -a group
+  : &gt; "$out"
+  for (( i = w; i &lt;= ${#files}; i += nworkers * 4 )); do
+    group=()
+    for (( j = i; j &lt;= ${#files} &amp;&amp; j &lt; i + nworkers * 4; j += nworkers )); do
+      wav="$tmpdir/w$j.wav"
+      if decode "${files[j]}" "$wav"; then
+        group+=($j "$wav")
+      else
+        print -r -- "$j"$'\t'err &gt;&gt; "$out"
+      fi
+    done
+    (( ${#group} )) &amp;&amp; "$JSC" "$js" -- "$weights" "${group[@]}" &gt;&gt; "$out" 2&gt;/dev/null
+    for (( j = 2; j &lt;= ${#group}; j += 2 )); do rm -f "${group[j]}"; done
+  done
+}
+
 progress_start "Find Key"
-"$PYTHON" "$py" "$weights" "$FFMPEG" "${files[@]}" &gt; "$tmpdir/keys.txt" 2&gt;/dev/null &amp;
-engine=$!
-while kill -0 $engine 2&gt;/dev/null; do
+workers=()
+for (( w = 1; w &lt;= nworkers; w++ )); do
+  worker $w &amp;
+  workers+=($!)
+done
+while (( ${#workers} )); do
   if cancelled; then
-    kill $engine 2&gt;/dev/null; wait $engine 2&gt;/dev/null
+    for p in "${workers[@]}"; do /usr/bin/pkill -P $p 2&gt;/dev/null; kill $p 2&gt;/dev/null; done
+    wait_all "${workers[@]}"
     progress_stop
     exit 0
   fi
-  ndone=$(/usr/bin/wc -l &lt; "$tmpdir/keys.txt"); ndone=${ndone// /}
+  running=()
+  for p in "${workers[@]}"; do kill -0 $p 2&gt;/dev/null &amp;&amp; running+=($p); done
+  workers=("${running[@]}")
+  ndone=$(cat "$tmpdir"/k*.txt 2&gt;/dev/null | /usr/bin/wc -l); ndone=${ndone// /}
   (( ndone &lt; ${#files} )) &amp;&amp; progress_set $ndone ${#files} "Analyzing $(( ndone + 1 )) of ${#files}" "${labels[ndone + 1]}"
-  sleep 0.2
+  (( ${#workers} )) &amp;&amp; sleep 0.2
 done
-wait $engine 2&gt;/dev/null
-progress_stop
-results=("${(@f)$(&lt;"$tmpdir/keys.txt")}")
+# The progress window stays up ("Preparing the results…") until the window with the
+# results opens: that window removes the progress file as it appears.
+progress_set 1 1 "Preparing the results…" ""
+export AQA_PROGRESS="$tmpdir/progress"
+typeset -A resof
+for r in "${(@f)$(cat "$tmpdir"/k*.txt 2&gt;/dev/null)}"; do resof[${r%%$'\t'*}]=$r; done
 
 specs=() keyof=() longof=() nfound=0 list=""
 for (( n = 1; n &lt;= ${#files}; n++ )); do
-  r=${results[n]}
+  r=${resof[$n]}
   fld=("${(@ps:\t:)r}")
   if [[ ${fld[1]} != $n || ${fld[2]} == err || -z ${fld[3]} ]]; then
     specs+=("${labels[n]}"$'\n'"!Could not be read")
@@ -1833,7 +2124,8 @@ for (( n = 1; n &lt;= ${#files}; n++ )); do
   keyof[n]=${names[c + 1]}
   longof[n]=${longnames[c + 1]}
   # the second most likely key
-  detail="Could be ${longnames[c2 + 1]} ($(printf '%.0f' $(( fld[5] * 100 )))%)"
+  printf -v pct '%.0f' $(( fld[5] * 100 ))
+  detail="Could be ${longnames[c2 + 1]} (${pct}%)"
   (( nfound++ ))
   specs+=("${labels[n]}"$'\n'"${longnames[c + 1]}"$'\n'"${detail}")
   list+="${labels[n]}"$'\t'"${longnames[c + 1]}"$'\n'
@@ -1859,6 +2151,7 @@ property centerValue : 1
 property centeredStyle : missing value
 property redColor : missing value
 property yellowColor : missing value
+property nameColor : missing value
 property logo : missing value
 property lastHeight : 0
 property optionBoxes : {}
@@ -1908,9 +2201,17 @@ on plainWindow(fileSpecs, summaryText, overText, dupText)
 	set msg to msg &amp; linefeed &amp; summaryText
 	try
 		if overText is "" then
+			-- the progress window ("Preparing the results…") closes when this window opens
+			try
+				(current application's NSFileManager's defaultManager())'s removeItemAtPath:((current application's NSProcessInfo's processInfo()'s environment())'s objectForKey:"AQA_PROGRESS") |error|:(missing value)
+			end try
 			display dialog msg with title "Find Key" buttons {"OK"} default button "OK"
 			return ""
 		end if
+		-- the progress window ("Preparing the results…") closes when this window opens
+		try
+			(current application's NSFileManager's defaultManager())'s removeItemAtPath:((current application's NSProcessInfo's processInfo()'s environment())'s objectForKey:"AQA_PROGRESS") |error|:(missing value)
+		end try
 		set d to display dialog (msg &amp; linefeed &amp; linefeed &amp; overText &amp; linefeed &amp; linefeed &amp; dupText) with title "Find Key" buttons {"Add Key to Metadata", "Add Key to Filename", "Close"} default button "Add Key to Metadata" cancel button "Close"
 	on error
 		return ""
@@ -1924,6 +2225,8 @@ on setupStyle(iconPath)
 	set ca to current application
 	set my redColor to ca's NSColor's colorWithSRGBRed:0.94 green:0.58 blue:0.47 alpha:1.0
 	set my yellowColor to ca's NSColor's colorWithSRGBRed:0.78 green:0.72 blue:0.48 alpha:0.85
+	-- file names: a soft, slightly warm white, quieter than the white of the values
+	set my nameColor to ca's NSColor's colorWithSRGBRed:0.78 green:0.77 blue:0.74 alpha:1.0
 	-- NSTextAlignmentCenter is 1 on Apple Silicon and 2 on Intel Macs
 	if (do shell script "/usr/bin/uname -m") is "x86_64" then
 		set my centerValue to 2
@@ -2065,7 +2368,7 @@ on fileBlock(spec, textWidth, specIndex)
 	set lns to paragraphs of spec
 	set parts to {}
 	set heights to {}
-	set end of parts to my lineLabel(item 1 of lns, true, 15, ca's NSColor's labelColor(), textWidth)
+	set end of parts to my lineLabel(item 1 of lns, true, 15, my nameColor, textWidth)
 	set end of heights to my lastHeight
 	if (item 2 of lns) starts with "!" then
 		set end of parts to my lineLabel(text 2 thru -1 of (item 2 of lns), false, 14, my yellowColor, textWidth)
@@ -2267,6 +2570,10 @@ on showWindow(fileSpecs, summaryText, overText, dupText)
 	end try
 	ca's NSApplication's sharedApplication()'s activateIgnoringOtherApps:true
 	set my windowShown to true
+	-- the progress window ("Preparing the results…") closes when this window opens
+	try
+		(current application's NSFileManager's defaultManager())'s removeItemAtPath:((current application's NSProcessInfo's processInfo()'s environment())'s objectForKey:"AQA_PROGRESS") |error|:(missing value)
+	end try
 	set response to (theAlert's runModal()) as integer
 	if overText is "" then return ""
 	if response = 1000 then return "Write"
@@ -2278,6 +2585,7 @@ APPLESCRIPT
 
 answer=$(/usr/bin/osascript "$tmpdir/dialog.applescript" "$tmpdir/icon.png" "$summary" \
   "$over_text" "$dup_text" "${specs[@]}" 2&gt;/dev/null)
+progress_stop
 
 if [[ $answer == Copy ]]; then
   print -rn -- "$list" | LANG=en_US.UTF-8 /usr/bin/pbcopy
@@ -2319,11 +2627,13 @@ fi
 [[ $answer == Write ]] || exit 0
 
 # --- 3. Write the keys -----------------------------------------------------------------
-same_audio() {   # a b
-  local x y
-  x=$("$FFMPEG" -nostdin -v error -i "$1" -map 0:a:0 -f md5 - 2&gt;/dev/null)
-  y=$("$FFMPEG" -nostdin -v error -i "$2" -map 0:a:0 -f md5 - 2&gt;/dev/null)
-  [[ -n $x &amp;&amp; $x == $y ]]
+same_audio() {   # a b: macOS decodes both files; the samples must be identical
+  local x="$tmpdir/sa$n.a.wav" y="$tmpdir/sa$n.b.wav" r=1
+  /usr/bin/afconvert -f WAVE -d LEF32 "$1" "$x" 2&gt;/dev/null \
+    &amp;&amp; /usr/bin/afconvert -f WAVE -d LEF32 "$2" "$y" 2&gt;/dev/null \
+    &amp;&amp; /usr/bin/cmp -s "$x" "$y" &amp;&amp; r=0
+  rm -f "$x" "$y"
+  return $r
 }
 
 # The new file replaces the original only once it is complete and checked.
@@ -2331,31 +2641,10 @@ same_audio() {   # a b
 key_job() {   # n
   local n=$1 f=${files[$1]} kind=${kinds[$1]} key=${keyof[$1]} res="$tmpdir/$1.res"
   local new="$tmpdir/$n.new.${f:e}" part="${f:h}/.${f:t}.key-part"
-  local -a v1
-  local checked=0 xing
-  case $kind in
-    aiff|wav)
-      if ! /usr/bin/perl "$pl" "$f" "$new" "$key" 2&gt;/dev/null; then
-        rm -f "$new"; print -r -- "err unexpected file structure" &gt; "$res"; return
-      fi ;;
-    mp3)
-      # keep an ID3v1 tag if the file had one
-      [[ $(tail -c 128 "$f" | head -c 3) == TAG ]] &amp;&amp; v1=(-write_id3v1 1)
-      # ffmpeg adds an "Info" header (encoder delay) to the MP3 it writes; when the
-      # original had none, players would skip its first 12 ms, so the check fails:
-      # the file is then written again without that header
-      for xing in 1 0; do
-        "$FFMPEG" -nostdin -v error -y -i "$f" -map 0 -c copy -map_metadata 0 \
-          -id3v2_version 3 "${v1[@]}" -write_xing $xing -metadata TKEY="$key" "$new" \
-          || { rm -f "$new"; print -r -- "err ffmpeg failed" &gt; "$res"; return }
-        same_audio "$f" "$new" &amp;&amp; { checked=1; break }
-      done ;;
-    flac)
-      "$FFMPEG" -nostdin -v error -y -i "$f" -map 0 -c copy -map_metadata 0 \
-        -metadata INITIALKEY="$key" "$new" \
-        || { rm -f "$new"; print -r -- "err ffmpeg failed" &gt; "$res"; return } ;;
-  esac
-  if (( ! checked )) &amp;&amp; ! same_audio "$f" "$new"; then
+  if ! /usr/bin/perl "$pl" "$f" "$new" "$key" "$kind" 2&gt;/dev/null; then
+    rm -f "$new"; print -r -- "err unexpected file structure" &gt; "$res"; return
+  fi
+  if ! same_audio "$f" "$new"; then
     rm -f "$new"; print -r -- "err check failed, file not written" &gt; "$res"; return
   fi
   if cp -p "$f" "$part" &amp;&amp; cat "$new" &gt; "$part" &amp;&amp; mv -f "$part" "$f"; then
@@ -2376,7 +2665,7 @@ for (( n = 1; n &lt;= ${#files}; n++ )); do
   pids+=($!)
   if (( ${#pids} &gt;= maxjobs )); then wait ${pids[1]}; shift pids; fi
 done
-wait ${pids[@]} 2&gt;/dev/null
+wait_all ${pids[@]}
 
 done_count=0 errors=""
 for (( n = 1; n &lt;= ${#files}; n++ )); do

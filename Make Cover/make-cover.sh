@@ -1,6 +1,7 @@
 #!/bin/zsh
 # Make Cover — macOS Finder Quick Action that draws a cover from the waveform of
-# each audio file and embeds it in the file.
+# each audio file and embeds it in the file. Needs nothing to be installed:
+# macOS decodes the audio (afconvert) and the tags are read and written in Perl.
 #
 # - The whole track is analyzed: the cover shows its loudness over time, as a
 #   mirrored waveform with a color gradient, so every track gets its own picture.
@@ -11,26 +12,46 @@
 #     AIFF, WAV: the picture frame of the ID3 chunk is replaced (or the chunk is
 #           added); every other chunk and every other tag is kept byte for byte.
 #           (WAV covers are read by DJ software, not by Music or the Finder.)
-#     FLAC, MP3, M4A: rewritten by ffmpeg without re-encoding (stream copy),
-#           keeping the tags.
+#     MP3: the picture frame of the ID3v2 tag is replaced (or the tag is added);
+#           the audio frames are copied byte for byte.
+#     FLAC: the PICTURE block is replaced; every other block and the audio frames
+#           are copied byte for byte.
 #   Every file is checked (same audio as before) before it is replaced.
 # - Save Image: the cover is saved as a JPEG next to each file instead.
 # - Works on files and on folders (searched with all their subfolders).
 # - A progress window with a Cancel button shows while the files are analyzed and
 #   while the covers are added.
 #
-# Requires ffmpeg. Runs with /bin/zsh.
+# Requires nothing but macOS. Runs with /bin/zsh.
 
 export LC_NUMERIC=C
 
-FFMPEG=""
-for p in /opt/homebrew/bin/ffmpeg /usr/local/bin/ffmpeg; do
-  [[ -x $p ]] && { FFMPEG=$p; break; }
-done
-FFPROBE=${FFMPEG%/*}/ffprobe
+# macOS cannot read a FLAC file that starts with an ID3 tag (not standard, but some
+# programs write one): such a file is decoded from a copy without the tag.
+afconvert_any() {   # afconvert options... INPUT OUTPUT
+  local in=${@[-2]} out=${@[-1]} skip t r
+  /usr/bin/afconvert "$@" 2>/dev/null && return 0
+  [[ $(head -c 3 "$in" 2>/dev/null) == ID3 ]] || return 1
+  skip=$(/usr/bin/perl -e 'open(F, "<:raw", $ARGV[0]) or exit; read(F, my $h, 10) == 10 or exit;
+    my @b = unpack("C4", substr($h, 6, 4)); my $n = 10 + (($b[0] << 21) | ($b[1] << 14) | ($b[2] << 7) | $b[3]);
+    $n += 10 if ord(substr($h, 3, 1)) == 4 && (ord(substr($h, 5, 1)) & 0x10); print $n' "$in")
+  [[ $skip == <-> ]] || return 1
+  t="$out.noid3.${in:e}"
+  if tail -c +$(( skip + 1 )) "$in" > "$t"; then
+    /usr/bin/afconvert "${@[1,-3]}" "$t" "$out" 2>/dev/null; r=$?
+  else
+    r=1
+  fi
+  rm -f "$t"
+  return $r
+}
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/makecover.XXXXXX") || exit 1
 trap '[[ -n $progress_pid ]] && kill $progress_pid 2>/dev/null; rm -rf "$tmpdir"' EXIT
+
+# Waits for every job given. (zsh's "wait pid1 pid2..." returns as soon as one of the
+# jobs has ended with an error, without waiting for the others.)
+wait_all() { local p; for p in "$@"; do wait $p 2>/dev/null; done }
 pl="$tmpdir/cover.pl"
 
 # --- Helper ------------------------------------------------------------------------
@@ -40,15 +61,37 @@ pl="$tmpdir/cover.pl"
 #                                   picture frame of the "ID3 " chunk is replaced (or
 #                                   the chunk is added); every other chunk and every
 #                                   other ID3 frame is kept byte for byte
-#   aifftags SRC                    title and artist found in the ID3 chunks of an AIFF file
+#   envwav COLUMNS FILE             same, from a 16-bit mono WAV file (decoded by macOS)
+#   tags SRC KIND                   title and artist of the file (KIND aiff, wav, mp3 or
+#                                   flac): ID3 tags, WAV INFO list, ID3v1 tag, Vorbis comment
+#   mp3cover SRC DST JPEG           DST = SRC (MP3) with JPEG as its cover: the picture
+#                                   frames of the ID3v2 tag at the start of the file are
+#                                   replaced (a tag is added if there is none); the audio
+#                                   and an ID3v1 tag at the end are copied byte for byte
+#   flaccover SRC DST JPEG          DST = SRC (FLAC) with JPEG as its front cover: the
+#                                   PICTURE blocks are replaced, every other block and the
+#                                   audio frames are copied byte for byte
 cat > "$pl" <<'PERL'
 use strict; use warnings;
 my $mode = shift @ARGV // '';
 
-if ($mode eq 'env') {
+if ($mode eq 'env' || $mode eq 'envwav') {
     my $cols = shift @ARGV;
-    binmode STDIN;
-    local $/; my $raw = <STDIN> // '';
+    my $raw = '';
+    if ($mode eq 'env') {
+        binmode STDIN;
+        local $/; $raw = <STDIN> // '';
+    } else {
+        # 16-bit WAV: the samples of its "data" chunk
+        open(my $w, '<:raw', $ARGV[0]) or exit 1;
+        local $/; my $all = <$w> // '';
+        my $pos = 12;
+        while ($pos + 8 <= length $all) {
+            my ($cid, $clen) = unpack('a4 V', substr($all, $pos, 8));
+            if ($cid eq 'data') { $raw = substr($all, $pos + 8, $clen); last }
+            $pos += 8 + $clen + ($clen & 1);
+        }
+    }
     my $n = int(length($raw) / 2);
     exit 1 if $n < $cols;
     my $seg = int($n / $cols);
@@ -79,9 +122,16 @@ if ($mode eq 'env') {
     exit 0;
 }
 
-if ($mode eq 'aifftags') {
-    my %t = aiff_tags($ARGV[0]);
+if ($mode eq 'tags') {
+    my %t = eval { file_tags(@ARGV) };
+    %t = (title => '', artist => '') unless %t;
     print "$t{title}\n$t{artist}\n";
+    exit 0;
+}
+if ($mode eq 'mp3cover' || $mode eq 'flaccover') {
+    my ($src, $dst, $jpeg) = @ARGV;
+    my $r = eval { $mode eq 'mp3cover' ? mp3_cover($src, $dst, $jpeg) : flac_cover($src, $dst, $jpeg); 1 };
+    unless ($r) { unlink $dst; print STDERR $@; exit 1 }
     exit 0;
 }
 if ($mode eq 'cover') {
@@ -152,33 +202,179 @@ sub id3_with_cover {
     return 'ID3' . pack('C C C', $ver, 0, $flags) . syncsafe(length $frames) . $frames;
 }
 
-# Title and artist of an AIFF file, from its ID3 chunks (UTF-8)
-sub aiff_tags {
-    my ($src) = @_;
+# Title and artist found in an ID3v2 tag, added to %$t where still empty (UTF-8)
+sub id3_text_tags {
+    my ($tag, $t) = @_;
+    require Encode;
+    my (undef, undef, $f) = eval { id3_frames($tag) };
+    for my $fr (@{ $f || [] }) {
+        my $key = $fr->[0] =~ /^(TT2|TIT2)$/ ? 'title' : $fr->[0] =~ /^(TP1|TPE1)$/ ? 'artist' : next;
+        next if length $t->{$key};
+        my ($enc, $txt) = (ord(substr($fr->[2], 0, 1)), substr($fr->[2], 1));
+        my $s = $enc == 0 ? Encode::decode('iso-8859-1', $txt)
+              : $enc == 1 ? Encode::decode('UTF-16', $txt)
+              : $enc == 2 ? Encode::decode('UTF-16BE', $txt)
+              : Encode::decode('UTF-8', $txt);
+        $s =~ s/\x00.*//s;
+        $t->{$key} = Encode::encode('UTF-8', $s);
+    }
+}
+# Plain text (ISO-8859-1, or UTF-8 when valid) -> UTF-8, without padding
+sub latin_text {
+    my ($s) = @_;
+    require Encode;
+    $s =~ s/\x00.*//s; $s =~ s/\s+\z//;
+    my $u = eval { Encode::decode('UTF-8', $s, Encode::FB_CROAK()) };
+    return Encode::encode('UTF-8', defined $u ? $u : Encode::decode('iso-8859-1', $s));
+}
+sub id3_size {   # size of an ID3v2 tag at the start of a file (0 if there is none)
+    my ($h) = @_;
+    return 0 unless length($h) >= 10 && substr($h, 0, 3) eq 'ID3';
+    my $n = 10 + unsyncsafe(substr($h, 6, 4));
+    $n += 10 if ord(substr($h, 3, 1)) == 4 && (ord(substr($h, 5, 1)) & 0x10);
+    return $n;
+}
+
+# Title and artist of a file (UTF-8)
+sub file_tags {
+    my ($src, $kind) = @_;
     my %t = (title => '', artist => '');
     open($IN, '<:raw', $src) or return %t;
     my $size = -s $IN;
-    my $pos = 12;
-    require Encode;
-    while ($pos + 8 <= $size) {
-        my ($cid, $clen) = unpack('a4 N', rd($pos, 8));
-        if ($cid eq 'ID3 ' || $cid eq 'id3 ') {
-            my (undef, undef, $f) = eval { id3_frames(rd($pos + 8, $clen)) };
-            for my $fr (@{ $f || [] }) {
-                my $key = $fr->[0] =~ /^(TT2|TIT2)$/ ? 'title' : $fr->[0] =~ /^(TP1|TPE1)$/ ? 'artist' : next;
-                next if length $t{$key};
-                my ($enc, $txt) = (ord(substr($fr->[2], 0, 1)), substr($fr->[2], 1));
-                my $s = $enc == 0 ? Encode::decode('iso-8859-1', $txt)
-                      : $enc == 1 ? Encode::decode('UTF-16', $txt)
-                      : $enc == 2 ? Encode::decode('UTF-16BE', $txt)
-                      : Encode::decode('UTF-8', $txt);
-                $s =~ s/\x00.*//s;
-                $t{$key} = Encode::encode('UTF-8', $s);
+    if ($kind eq 'aiff' || $kind eq 'wav') {
+        my $L = rd(0, 4) eq 'RIFF' ? 'V' : 'N';
+        my $pos = 12;
+        my %info;
+        while ($pos + 8 <= $size) {
+            my ($cid, $clen) = unpack("a4 $L", rd($pos, 8));
+            if ($cid eq 'ID3 ' || $cid eq 'id3 ') {
+                id3_text_tags(rd($pos + 8, $clen), \%t);
+            } elsif ($cid eq 'LIST' && $L eq 'V' && rd($pos + 8, 4) eq 'INFO') {
+                my $d = rd($pos + 12, $clen - 4);
+                my $p = 0;
+                while ($p + 8 <= length $d) {
+                    my ($id, $l) = unpack('a4 V', substr($d, $p, 8));
+                    $info{$id} //= latin_text(substr($d, $p + 8, $l));
+                    $p += 8 + $l + ($l & 1);
+                }
+            }
+            $pos += 8 + $clen + ($clen & 1);
+        }
+        $t{title}  = $info{INAM} // '' unless length $t{title};
+        $t{artist} = $info{IART} // '' unless length $t{artist};
+    } elsif ($kind eq 'mp3') {
+        my $n = id3_size(rd(0, 10));
+        id3_text_tags(rd(0, $n), \%t) if $n;
+        if ($size >= 128 && rd($size - 128, 3) eq 'TAG') {        # ID3v1
+            my $v1 = rd($size - 128, 128);
+            $t{title}  = latin_text(substr($v1, 3, 30))  unless length $t{title};
+            $t{artist} = latin_text(substr($v1, 33, 30)) unless length $t{artist};
+        }
+    } elsif ($kind eq 'flac') {
+        my $pos = id3_size(rd(0, 10));
+        my $id3 = $pos ? rd(0, $pos) : undef;
+        if (rd($pos, 4) eq 'fLaC') {
+            $pos += 4;
+            my $last = 0;
+            until ($last || $pos + 4 > $size) {
+                my $h = rd($pos, 4);
+                $last = ord(substr($h, 0, 1)) & 0x80;
+                my $type = ord(substr($h, 0, 1)) & 0x7F;
+                my $len = unpack('N', "\0" . substr($h, 1, 3));
+                if ($type == 4) {                                    # Vorbis comment
+                    my $d = rd($pos + 4, $len);
+                    my $p = 4 + unpack('V', substr($d, 0, 4));
+                    my $count = unpack('V', substr($d, $p, 4)); $p += 4;
+                    for (1 .. $count) {
+                        last if $p + 4 > length $d;
+                        my $l = unpack('V', substr($d, $p, 4));
+                        my $e = substr($d, $p + 4, $l); $p += 4 + $l;
+                        $t{title}  = $1 if $e =~ /^TITLE=(.*)\z/si  && !length $t{title};
+                        $t{artist} = $1 if $e =~ /^ARTIST=(.*)\z/si && !length $t{artist};
+                    }
+                }
+                $pos += 4 + $len;
             }
         }
-        $pos += 8 + $clen + ($clen & 1);
+        id3_text_tags($id3, \%t) if defined $id3;
     }
+    close $IN;
     return %t;
+}
+
+sub mp3_cover {
+    my ($src, $dst, $jpeg) = @_;
+    open(my $J, '<:raw', $jpeg) or die "jpeg\n"; my $pic = do { local $/; <$J> }; close $J;
+    open($IN, '<:raw', $src) or die "open\n";
+    open($OUT, '>:raw', $dst) or die "create\n";
+    my $size = -s $IN;
+    my $start = id3_size(rd(0, 10));
+    die "id3 size\n" if $start > $size;
+    wr(id3_with_cover($start ? rd(0, $start) : undef, $pic));
+    copy_range($start, $size - $start);
+    close($OUT) or die "write\n";
+    close($IN);
+}
+
+# width and height of a JPEG picture (from its SOF marker)
+sub jpeg_size {
+    my ($p) = @_;
+    my $i = 2;
+    while ($i + 9 < length $p) {
+        last unless substr($p, $i, 1) eq "\xFF";
+        my $m = ord(substr($p, $i + 1, 1));
+        my $l = unpack('n', substr($p, $i + 2, 2));
+        if ($m >= 0xC0 && $m <= 0xCF && $m != 0xC4 && $m != 0xC8 && $m != 0xCC) {
+            my ($h, $w) = unpack('n n', substr($p, $i + 5, 4));
+            return ($w, $h);
+        }
+        $i += 2 + $l;
+    }
+    return (0, 0);
+}
+
+sub flac_cover {
+    my ($src, $dst, $jpeg) = @_;
+    open(my $J, '<:raw', $jpeg) or die "jpeg\n"; my $pic = do { local $/; <$J> }; close $J;
+    open($IN, '<:raw', $src) or die "open\n";
+    open($OUT, '>:raw', $dst) or die "create\n";
+    my $size = -s $IN;
+    my $pos = id3_size(rd(0, 10));                  # an ID3 tag in front: kept as is
+    copy_range(0, $pos) if $pos;
+    die "not flac\n" unless rd($pos, 4) eq 'fLaC';
+    $pos += 4;
+    my (@blocks, $last);
+    do {
+        my $h = rd($pos, 4);
+        die "truncated\n" unless length($h) == 4;
+        $last = ord(substr($h, 0, 1)) & 0x80;
+        my $len = unpack('N', "\0" . substr($h, 1, 3));
+        die "truncated\n" if $pos + 4 + $len > $size;
+        push @blocks, { type => ord(substr($h, 0, 1)) & 0x7F, pos => $pos + 4, len => $len };
+        $pos += 4 + $len;
+    } until $last;
+    die "streaminfo\n" unless $blocks[0]{type} == 0;
+    # PICTURE: front cover (3), image/jpeg, no description, size, 24-bit colour
+    my ($w, $h) = jpeg_size($pic);
+    my $mime = 'image/jpeg';
+    my $data = pack('N N', 3, length $mime) . $mime . pack('N', 0)
+             . pack('N N N N N', $w, $h, 24, 0, length $pic) . $pic;
+    die "picture too large\n" if length($data) > 0xFFFFFF;
+    @blocks = grep { $_->{type} != 6 } @blocks;
+    # after the Vorbis comment if there is one, else after STREAMINFO
+    my $at = 1;
+    for my $i (0 .. $#blocks) { $at = $i + 1 if $blocks[$i]{type} == 4 }
+    splice(@blocks, $at, 0, { type => 6, data => $data });
+    wr('fLaC');
+    for my $i (0 .. $#blocks) {
+        my $b = $blocks[$i];
+        my $len = defined $b->{data} ? length $b->{data} : $b->{len};
+        wr(chr(($i == $#blocks ? 0x80 : 0) | $b->{type}) . substr(pack('N', $len), 1, 3));
+        if (defined $b->{data}) { wr($b->{data}) } else { copy_range($b->{pos}, $b->{len}) }
+    }
+    copy_range($pos, $size - $pos);
+    close($OUT) or die "write\n";
+    close($IN);
 }
 
 sub aiff_cover {
@@ -233,6 +429,7 @@ notify() {
     -e 'end run' "$1" "$2" >/dev/null 2>&1
 }
 alert() {
+  progress_stop 2>/dev/null
   /usr/bin/osascript -e 'on run argv' \
     -e 'display alert (item 1 of argv) message (item 2 of argv) as warning' \
     -e 'end run' "$1" "$2" >/dev/null 2>&1
@@ -241,10 +438,6 @@ plural() {   # plural 3 file -> "3 files"
   if (( $1 == 1 )); then print -r -- "$1 $2"; else print -r -- "$1 $2s"; fi
 }
 
-if [[ -z $FFMPEG || ! -x $FFPROBE ]]; then
-  alert "ffmpeg not found" "Make Cover needs ffmpeg. Install it with Homebrew: brew install ffmpeg"
-  exit 0
-fi
 
 maxjobs=$(/usr/sbin/sysctl -n hw.ncpu 2>/dev/null)
 [[ $maxjobs == <-> ]] || maxjobs=4
@@ -1632,7 +1825,7 @@ cancelled() { [[ -e $tmpdir/cancel ]] }
 
 # --- 1. Supported files -------------------------------------------------------------
 # Selected folders are searched with all their subfolders; only their AIFF, WAV,
-# FLAC, MP3 and M4A files are used (every other file is ignored, and so are hidden
+# FLAC and MP3 files are used (every other file is ignored, and so are hidden
 # files). Files found in a folder are shown with their path in it.
 files=() kinds=() labels=() skipped=""
 add_file() {   # file label
@@ -1640,7 +1833,6 @@ add_file() {   # file label
     aif|aiff|aifc) kinds+=(aiff) ;;
     flac)          kinds+=(flac) ;;
     mp3)           kinds+=(mp3) ;;
-    m4a)           kinds+=(m4a) ;;
     wav)           kinds+=(wav) ;;
     *)             return 1 ;;
   esac
@@ -1649,7 +1841,7 @@ add_file() {   # file label
 add_folder() {   # folder
   setopt localoptions extendedglob
   local d=${1%/} g
-  for g in $d/**/*.(#i)(aif|aiff|aifc|flac|mp3|m4a|wav)(N.n); do
+  for g in $d/**/*.(#i)(aif|aiff|aifc|flac|mp3|wav)(N.n); do
     add_file "$g" "${g#$d/}"
   done
 }
@@ -1657,11 +1849,11 @@ for f in "$@"; do
   if [[ -d $f ]]; then
     add_folder "$f"
   elif [[ -f $f ]]; then
-    add_file "$f" "${f:t}" || skipped+="${f:t}: not an AIFF, WAV, FLAC, MP3 or M4A file"$'\n'
+    add_file "$f" "${f:t}" || skipped+="${f:t}: not an AIFF, WAV, FLAC or MP3 file"$'\n'
   fi
 done
 if (( ${#files} == 0 )); then
-  alert "No file can get a cover" "Make Cover works on AIFF, WAV, FLAC, MP3 and M4A files."$'\n\n'"${skipped}"
+  alert "No file can get a cover" "Make Cover works on AIFF, WAV, FLAC and MP3 files."$'\n\n'"${skipped}"
   exit 0
 fi
 
@@ -1677,14 +1869,9 @@ tidy() {
 # Suggestion: the tags first, else the file name ("01 - Artist - Title")
 suggest() {   # file kind -> two lines: title, artist
   local t="" a="" base
-  if [[ $2 == aiff ]]; then
-    local -a tg
-    tg=("${(@f)$(/usr/bin/perl "$pl" aifftags "$1" 2>/dev/null)}")
-    t=${tg[1]}; a=${tg[2]}
-  else
-    t=$("$FFPROBE" -v error -show_entries format_tags=title -of default=nw=1:nk=1 "$1" 2>/dev/null | head -1)
-    a=$("$FFPROBE" -v error -show_entries format_tags=artist -of default=nw=1:nk=1 "$1" 2>/dev/null | head -1)
-  fi
+  local -a tg
+  tg=("${(@f)$(/usr/bin/perl "$pl" tags "$1" "$2" 2>/dev/null)}")
+  t=${tg[1]}; a=${tg[2]}
   base=${1:t:r}; base=${base//_/ }
   base=$(print -r -- "$base" | /usr/bin/perl -pe 's/^\s*(\d{1,3}\s*[-.)]\s*|0\d\s+)//')
   if [[ $base == *" - "* ]]; then
@@ -1700,8 +1887,10 @@ analyze() {   # n file kind
   local e
   local -a s
   s=("${(@f)$(suggest "$2" "$3")}")
-  e=$("$FFMPEG" -nostdin -v error -i "$2" -map 0:a:0 -ac 1 -ar 11025 -f s16le - 2>/dev/null \
-        | /usr/bin/perl "$pl" env 900)
+  # macOS decodes the track to 16-bit mono at 11025 Hz
+  afconvert_any -f WAVE -d LEI16@11025 -c 1 "$2" "$tmpdir/$1.wav" \
+    && e=$(/usr/bin/perl "$pl" envwav 900 "$tmpdir/$1.wav")
+  rm -f "$tmpdir/$1.wav"
   [[ -n $e ]] || return
   print -r -- "${s[1]}"$'\n'"${s[2]}"$'\n'"$e" > "$tmpdir/$1.env"
 }
@@ -1715,8 +1904,11 @@ for (( n = 1; n <= ${#files}; n++ )); do
   pids+=($!)
   if (( ${#pids} >= maxjobs )); then wait ${pids[1]}; shift pids; fi
 done
-wait ${pids[@]} 2>/dev/null
-progress_stop
+wait_all ${pids[@]}
+# The progress window stays up ("Preparing the results…") until the window with the
+# results opens: that window removes the progress file as it appears.
+progress_set 1 1 "Preparing the results…" ""
+export AQA_PROGRESS="$tmpdir/progress"
 cancelled && exit 0
 
 ok=() names=()
@@ -1755,6 +1947,7 @@ property centerValue : 1
 property centeredStyle : missing value
 property redColor : missing value
 property yellowColor : missing value
+property nameColor : missing value
 property logo : missing value
 property lastHeight : 0
 property styleNames : {"Waveform", "Circle"}
@@ -1845,6 +2038,8 @@ on setupStyle(iconPath)
 	set ca to current application
 	set my redColor to ca's NSColor's colorWithSRGBRed:0.94 green:0.58 blue:0.47 alpha:1.0
 	set my yellowColor to ca's NSColor's colorWithSRGBRed:0.78 green:0.72 blue:0.48 alpha:0.85
+	-- file names: a soft, slightly warm white, quieter than the white of the values
+	set my nameColor to ca's NSColor's colorWithSRGBRed:0.78 green:0.77 blue:0.74 alpha:1.0
 	-- NSTextAlignmentCenter is 1 on Apple Silicon and 2 on Intel Macs
 	if (do shell script "/usr/bin/uname -m") is "x86_64" then
 		set my centerValue to 2
@@ -2404,6 +2599,10 @@ on showWindow(addText, saveText)
 		set my pollTimer to ca's NSTimer's timerWithTimeInterval:0.25 target:me selector:"pollFields:" userInfo:(missing value) repeats:true
 		(ca's NSRunLoop's currentRunLoop())'s addTimer:(my pollTimer) forMode:(ca's NSModalPanelRunLoopMode)
 	end try
+	-- the progress window ("Preparing the results…") closes when this window opens
+	try
+		(current application's NSFileManager's defaultManager())'s removeItemAtPath:((current application's NSProcessInfo's processInfo()'s environment())'s objectForKey:"AQA_PROGRESS") |error|:(missing value)
+	end try
 	set response to (theAlert's runModal()) as integer
 	try
 		(my pollTimer)'s invalidate()
@@ -2421,6 +2620,7 @@ APPLESCRIPT
 
 answer=$(/usr/bin/osascript "$tmpdir/dialog.applescript" "$tmpdir/icon.png" "$add_text" "$save_text" \
   "$tmpdir/trig.txt" ${#envs} "${envs[@]}" "${names[@]}" 2>"$tmpdir/osa.err")
+progress_stop
 case $answer in
   Add|Save) ;;
   "") [[ -s $tmpdir/osa.err ]] && alert "Make Cover could not open its window" "$(<"$tmpdir/osa.err")"
@@ -2429,11 +2629,12 @@ case $answer in
 esac
 
 # --- 4. Save the images, or embed them --------------------------------------------------
-same_audio() {   # a b
-  local x y
-  x=$("$FFMPEG" -nostdin -v error -i "$1" -map 0:a:0 -f md5 - 2>/dev/null)
-  y=$("$FFMPEG" -nostdin -v error -i "$2" -map 0:a:0 -f md5 - 2>/dev/null)
-  [[ -n $x && $x == $y ]]
+same_audio() {   # a b: macOS decodes both files; the samples must be identical
+  local x="$tmpdir/sa.${2:t}.a.wav" y="$tmpdir/sa.${2:t}.b.wav" r=1
+  afconvert_any -f WAVE -d LEF32 "$1" "$x" && afconvert_any -f WAVE -d LEF32 "$2" "$y" \
+    && /usr/bin/cmp -s "$x" "$y" && r=0
+  rm -f "$x" "$y"
+  return $r
 }
 
 # The new file replaces the original only once it is complete and checked.
@@ -2441,31 +2642,15 @@ same_audio() {   # a b
 cover_job() {   # n file kind jpeg
   local n=$1 f=$2 kind=$3 jpg=$4 res="$tmpdir/$1.res"
   local new="$tmpdir/$n.new.${f:e}" part="${f:h}/.${f:t}.cover-part"
-  local -a v1
-  local checked=0 xing
+  local cmd=cover
   case $kind in
-    aiff|wav)
-      if ! /usr/bin/perl "$pl" cover "$f" "$new" "$jpg" 2>/dev/null; then
-        rm -f "$new"; print -r -- "err unexpected file structure" > "$res"; return
-      fi ;;
-    mp3)
-      # keep an ID3v1 tag if the file had one
-      [[ $(tail -c 128 "$f" | head -c 3) == TAG ]] && v1=(-write_id3v1 1)
-      # ffmpeg adds an "Info" header (encoder delay) to the MP3 it writes; when the
-      # original had none, players would skip its first 12 ms, so the check fails:
-      # the file is then written again without that header
-      for xing in 1 0; do
-        "$FFMPEG" -nostdin -v error -y -i "$f" -i "$jpg" -map 0:a -map 1 -c copy -map_metadata 0 \
-          -id3v2_version 3 "${v1[@]}" -write_xing $xing -metadata:s:v title="Album cover" \
-          -metadata:s:v comment="Cover (front)" -disposition:v:0 attached_pic "$new" \
-          || { rm -f "$new"; print -r -- "err ffmpeg failed" > "$res"; return }
-        same_audio "$f" "$new" && { checked=1; break }
-      done ;;
-    flac|m4a)
-      "$FFMPEG" -nostdin -v error -y -i "$f" -i "$jpg" -map 0:a -map 1 -c copy -map_metadata 0 \
-        -disposition:v:0 attached_pic "$new" || { rm -f "$new"; print -r -- "err ffmpeg failed" > "$res"; return } ;;
+    mp3)  cmd=mp3cover ;;
+    flac) cmd=flaccover ;;
   esac
-  if (( ! checked )) && ! same_audio "$f" "$new"; then
+  if ! /usr/bin/perl "$pl" $cmd "$f" "$new" "$jpg" 2>/dev/null; then
+    rm -f "$new"; print -r -- "err unexpected file structure" > "$res"; return
+  fi
+  if ! same_audio "$f" "$new"; then
     rm -f "$new"; print -r -- "err check failed, file not written" > "$res"; return
   fi
   if cp -p "$f" "$part" && cat "$new" > "$part" && mv -f "$part" "$f"; then
@@ -2503,7 +2688,7 @@ else
     pids+=($!)
     if (( ${#pids} >= maxjobs )); then wait ${pids[1]}; shift pids; fi
   done
-  wait ${pids[@]} 2>/dev/null
+  wait_all ${pids[@]}
   progress_stop
   for n in "${ok[@]}"; do
     r=""

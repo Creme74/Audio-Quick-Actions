@@ -1,6 +1,9 @@
 #!/bin/zsh
 # Find Mono — macOS Finder Quick Action that finds mono audio hidden in stereo files
-# and can turn those files into real mono files.
+# and can turn those files into real mono files. Needs nothing to be installed: the
+# analysis and the checks are done in JavaScript by jsc (the JavaScriptCore engine of
+# macOS), on the samples exactly as they are stored; FLAC files are decoded and
+# encoded by macOS (afconvert).
 #
 # - Analyzes every selected file:
 #     100% Mono    both channels carry the same signal (bit for bit, or apart from
@@ -25,9 +28,10 @@
 # - WAV / AIFF / CAF: every chunk is kept byte for byte (Apple Loops metadata,
 #   markers, ID3 tags...), except the ones that describe the channels. Finder tags
 #   and Spotlight comments are kept too. Bit depth and sample rate never change.
-# - FLAC: re-encoded to mono FLAC with ffmpeg, keeping tags and cover art.
+# - FLAC: decoded and re-encoded to mono FLAC by macOS (afconvert); every metadata
+#   block of the original (tags, cover art...) is put back in the new file.
 #
-# Requires ffmpeg. Runs with /bin/zsh.
+# Requires nothing but macOS. Runs with /bin/zsh.
 
 copydir="Mono"                 # subfolder used by "Duplicate"
 # Channels that differ by no more than this many steps of the file's resolution
@@ -36,14 +40,37 @@ dither_steps=8
 
 export LC_NUMERIC=C
 
-FFMPEG=""
-for p in /opt/homebrew/bin/ffmpeg /usr/local/bin/ffmpeg; do
-  [[ -x $p ]] && { FFMPEG=$p; break; }
-done
-FFPROBE=${FFMPEG%/*}/ffprobe
+# jsc, the JavaScript engine built into macOS (JavaScriptCore). Its readFile and
+# writeFile functions read and write the audio; writeFile came with macOS 13 Ventura,
+# so both are checked before anything is done.
+JSC=/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc
+
+# macOS cannot read a FLAC file that starts with an ID3 tag (not standard, but some
+# programs write one): such a file is decoded from a copy without the tag.
+afconvert_any() {   # afconvert options... INPUT OUTPUT
+  local in=${@[-2]} out=${@[-1]} skip t r
+  /usr/bin/afconvert "$@" 2>/dev/null && return 0
+  [[ $(head -c 3 "$in" 2>/dev/null) == ID3 ]] || return 1
+  skip=$(/usr/bin/perl -e 'open(F, "<:raw", $ARGV[0]) or exit; read(F, my $h, 10) == 10 or exit;
+    my @b = unpack("C4", substr($h, 6, 4)); my $n = 10 + (($b[0] << 21) | ($b[1] << 14) | ($b[2] << 7) | $b[3]);
+    $n += 10 if ord(substr($h, 3, 1)) == 4 && (ord(substr($h, 5, 1)) & 0x10); print $n' "$in")
+  [[ $skip == <-> ]] || return 1
+  t="$out.noid3.${in:e}"
+  if tail -c +$(( skip + 1 )) "$in" > "$t"; then
+    /usr/bin/afconvert "${@[1,-3]}" "$t" "$out" 2>/dev/null; r=$?
+  else
+    r=1
+  fi
+  rm -f "$t"
+  return $r
+}
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/findmono.XXXXXX") || exit 1
 trap '[[ -n $progress_pid ]] && kill $progress_pid 2>/dev/null; rm -rf "$tmpdir"' EXIT
+
+# Waits for every job given. (zsh's "wait pid1 pid2..." returns as soon as one of the
+# jobs has ended with an error, without waiting for the others.)
+wait_all() { local p; for p in "$@"; do wait $p 2>/dev/null; done }
 pl="$tmpdir/afmeta.pl"
 
 # --- File structure helper -------------------------------------------------------
@@ -53,6 +80,9 @@ pl="$tmpdir/afmeta.pl"
 #   extract FILE OFFSET LENGTH   writes the audio bytes to stdout
 #   splice FILE OFFSET LENGTH RAW  overwrites the audio bytes with RAW (same size)
 #   flacinfo FILE                prints "BITS RATE"
+#   flacmerge ORIG ENC OUT       OUT = ENC (a FLAC file encoded by macOS) with the
+#                                metadata blocks of ORIG (tags, pictures...) instead of
+#                                its own; STREAMINFO is ENC's, ORIG's SEEKTABLE is dropped
 #   mono SRC DST [CH]            writes DST: SRC with only channel CH (0 = left,
 #                                1 = right), every other chunk kept byte for byte
 cat > "$pl" <<'PERL'
@@ -92,6 +122,11 @@ if ($mode eq 'mono') {   # mono SRC DST [CH]: DST = SRC with only channel CH (0 
     my $r = eval { mono_file($src, $dst, $keep // 0); 1 };
     unless ($r) { unlink $dst; print STDERR $@; exit 1 }
     exit 0;
+}
+if ($mode eq 'flacmerge') {
+    my $ok = eval { flac_merge(@ARGV); 1 };
+    unlink $ARGV[2] unless $ok;
+    exit($ok ? 0 : 1);
 }
 if ($mode eq 'flacinfo') {
     my @r = eval { open(my $fh, '<:raw', $ARGV[0]) or die "open\n"; flac($fh) };
@@ -217,6 +252,55 @@ sub caf {
     my $end = ($flags & 2) ? 'L' : 'B';
     return ('pcm', $enc, 8 * $bpp / $ch, $end, $doff,
             clamp_len($size, $doff, $dlen, $bpp), $ch, rate_ok($rate));
+}
+
+# metadata blocks of a FLAC file: (list of [type, data], offset of the audio frames)
+sub flac_blocks {
+    my ($fh) = @_;
+    my $m;
+    read($fh, $m, 4) == 4 && $m eq 'fLaC' or die "flac\n";
+    my ($pos, $last, @b) = (4, 0);
+    until ($last) {
+        read($fh, my $h, 4) == 4 or die "short\n";
+        my $b0 = ord(substr($h, 0, 1));
+        $last = $b0 & 0x80;
+        my $len = unpack('N', "\0" . substr($h, 1, 3));
+        my $d = '';
+        $len == 0 || read($fh, $d, $len) == $len or die "short\n";
+        push @b, [$b0 & 0x7F, $d];
+        $pos += 4 + $len;
+    }
+    return (\@b, $pos);
+}
+sub flac_merge {
+    my ($orig, $enc, $out) = @_;
+    open(my $o, '<:raw', $orig) or die "open\n";
+    open(my $e, '<:raw', $enc) or die "open\n";
+    # an ID3 tag in front of the original FLAC data is kept in front of the new one
+    my ($pre, $h) = ('', '');
+    read($o, $h, 10);
+    if (length($h) == 10 && substr($h, 0, 3) eq 'ID3') {
+        my @s = unpack('C4', substr($h, 6, 4));
+        my $n = 10 + (($s[0] << 21) | ($s[1] << 14) | ($s[2] << 7) | $s[3]);
+        $n += 10 if ord(substr($h, 3, 1)) == 4 && (ord(substr($h, 5, 1)) & 0x10);
+        seek($o, 0, 0); read($o, $pre, $n) == $n or die "short\n";
+    } else {
+        seek($o, 0, 0);
+    }
+    my ($ob) = flac_blocks($o);
+    my ($eb, $audio) = flac_blocks($e);
+    $eb->[0][0] == 0 or die "streaminfo\n";
+    my @blocks = ($eb->[0], grep { $_->[0] != 0 && $_->[0] != 3 } @$ob);
+    open(my $w, '>:raw', $out) or die "create\n";
+    print {$w} $pre, 'fLaC' or die "write\n";
+    for my $i (0 .. $#blocks) {
+        my ($t, $d) = @{ $blocks[$i] };
+        print {$w} chr(($i == $#blocks ? 0x80 : 0) | $t), substr(pack('N', length $d), 1, 3), $d or die "write\n";
+    }
+    seek($e, $audio, 0) or die "seek\n";
+    my $buf;
+    while (read($e, $buf, 1048576)) { print {$w} $buf or die "write\n" }
+    close($w) or die "write\n";
 }
 
 sub flac {   # STREAMINFO, after an optional ID3v2 tag
@@ -413,6 +497,7 @@ notify() {
     -e 'end run' "$1" "$2" >/dev/null 2>&1
 }
 alert() {
+  progress_stop 2>/dev/null
   /usr/bin/osascript -e 'on run argv' \
     -e 'display alert (item 1 of argv) message (item 2 of argv) as warning' \
     -e 'end run' "$1" "$2" >/dev/null 2>&1
@@ -421,36 +506,159 @@ plural() {   # plural 3 file -> "3 files"
   if (( $1 == 1 )); then print -r -- "$1 $2"; else print -r -- "$1 $2s"; fi
 }
 
-if [[ -z $FFMPEG || ! -x $FFPROBE ]]; then
-  alert "ffmpeg not found" "Find Mono needs ffmpeg. Install it with Homebrew: brew install ffmpeg"
+if [[ ! -x $JSC || $("$JSC" -e 'print(typeof readFile + typeof writeFile)' 2>/dev/null) != functionfunction ]]; then
+  alert "macOS 13 or later needed" "Find Mono needs macOS 13 Ventura or later: it uses jsc, the JavaScript engine built into macOS, which is missing or too old on this Mac."
   exit 0
 fi
+
+# The analysis and the checks, in JavaScript (run by jsc)
+jsm="$tmpdir/mono.js"
+cat > "$jsm" <<'JAVASCRIPT'
+// Find Mono: analysis and checks in JavaScript, run by jsc (the JavaScript engine
+// of macOS). The samples are read exactly as they are stored (no conversion).
+//
+//   jsc mono.js -- analyze pcm SRC OFFSET LENGTH ENC BITS ENDIAN CHANNELS
+//   jsc mono.js -- analyze wav FILE.wav            (integer WAV written by afconvert)
+//       "ch N" (not stereo), or "st <peak L> <R> <L-R> <L+R> <RMS L> <R> <L-R> <L+R>"
+//       in dB relative to full scale (-inf for digital silence), the same values as
+//       ffmpeg's astats on the samples converted to double
+//   jsc mono.js -- extract IN.wav OUT.wav CHANNEL  (0 = left, 1 = right)
+//       OUT = a mono WAV with that channel of IN, sample for sample
+//   jsc mono.js -- same pcm SRC OFF LEN BITS CHANNELS CHANNEL MONO MOFF MLEN
+//   jsc mono.js -- same wav STEREO.wav CHANNEL MONO.wav
+//       "ok" if the mono audio is exactly that channel of the stereo audio, else "diff"
+
+function fmtDb(x) { return x > 0 ? String(20 * Math.log10(x)) : '-inf'; }
+
+function wavInfo(u) {
+  var dv = new DataView(u.buffer, u.byteOffset, u.byteLength), pos = 12, d = {};
+  if (String.fromCharCode(u[0], u[1], u[2], u[3]) !== 'RIFF') throw new Error('not a WAV file');
+  while (pos + 8 <= u.byteLength) {
+    var id = String.fromCharCode(u[pos], u[pos + 1], u[pos + 2], u[pos + 3]), size = dv.getUint32(pos + 4, true);
+    if (id === 'fmt ') {
+      d.tag = dv.getUint16(pos + 8, true); d.ch = dv.getUint16(pos + 10, true);
+      d.rate = dv.getUint32(pos + 12, true); d.align = dv.getUint16(pos + 20, true);
+      d.bits = 8 * d.align / d.ch;
+    }
+    if (id === 'data') { d.off = pos + 8; d.len = Math.min(size, u.byteLength - d.off); break; }
+    pos += 8 + size + (size & 1);
+  }
+  if (d.off === undefined || !d.ch) throw new Error('unexpected WAV file');
+  d.enc = d.tag === 3 ? 'floating-point' : (d.bits === 8 ? 'unsigned-integer' : 'signed-integer');
+  return d;
+}
+
+// reader of sample k (all channels interleaved) as a number relative to full scale
+function reader(u, off, enc, bits, big) {
+  var bytes = bits >> 3, dv = new DataView(u.buffer, u.byteOffset + off), le = !big;
+  if (enc === 'floating-point') {
+    if (bits === 32) return function (k) { return dv.getFloat32(4 * k, le); };
+    if (bits === 64) return function (k) { return dv.getFloat64(8 * k, le); };
+    throw new Error('unsupported float format');
+  }
+  var scale = Math.pow(2, bits - 1), sh = 32 - bits, unsigned = enc === 'unsigned-integer';
+  if (!big && bits === 16) return function (k) { return dv.getInt16(2 * k, true) / 32768; };
+  if (big && bits === 16) return function (k) { return dv.getInt16(2 * k, false) / 32768; };
+  if (bits === 32) return function (k) { return dv.getInt32(4 * k, le) / 2147483648; };
+  return function (k) {
+    var p = k * bytes, v = 0, i;
+    if (big) for (i = 0; i < bytes; i++) v = v * 256 + u[off + p + i];
+    else for (i = bytes - 1; i >= 0; i--) v = v * 256 + u[off + p + i];
+    v = unsigned ? v - 128 : (v << sh) >> sh;
+    return v / scale;
+  };
+}
+
+function analyze(u, off, len, enc, bits, big, ch) {
+  if (ch !== 2) return 'ch ' + ch;
+  var get = reader(u, off, enc, bits, big), frames = Math.floor(len / (2 * (bits >> 3)));
+  var pL = 0, pR = 0, pD = 0, pS = 0, sL = 0, sR = 0, sD = 0, sS = 0;
+  for (var i = 0; i < frames; i++) {
+    var l = get(2 * i), r = get(2 * i + 1), d = l - r, s = l + r;
+    var al = l < 0 ? -l : l, ar = r < 0 ? -r : r, ad = d < 0 ? -d : d, as = s < 0 ? -s : s;
+    if (al > pL) pL = al; if (ar > pR) pR = ar; if (ad > pD) pD = ad; if (as > pS) pS = as;
+    sL += l * l; sR += r * r; sD += d * d; sS += s * s;
+  }
+  if (!frames) return 'err';
+  return ['st', fmtDb(pL), fmtDb(pR), fmtDb(pD), fmtDb(pS),
+          fmtDb(Math.sqrt(sL / frames)), fmtDb(Math.sqrt(sR / frames)),
+          fmtDb(Math.sqrt(sD / frames)), fmtDb(Math.sqrt(sS / frames))].join(' ');
+}
+
+// bytes of one channel of interleaved audio, compared with mono audio
+function sameChannel(u, off, len, bytes, ch, c, m, moff, mlen) {
+  var frames = Math.floor(len / (bytes * ch));
+  if (mlen !== frames * bytes) return 'diff';
+  for (var i = 0; i < frames; i++) {
+    var a = off + (i * ch + c) * bytes, b = moff + i * bytes;
+    for (var k = 0; k < bytes; k++) if (u[a + k] !== m[b + k]) return 'diff';
+  }
+  return 'ok';
+}
+
+function main(a) {
+  try {
+    var u, w, m, mw;
+    if (a[0] === 'analyze' && a[1] === 'pcm') {
+      u = readFile(a[2], 'binary');
+      if (+a[3] + +a[4] > u.length) throw new Error('short file');
+      print(analyze(u, +a[3], +a[4], a[5], +a[6], a[7] === 'B', +a[8]));
+    } else if (a[0] === 'analyze' && a[1] === 'wav') {
+      u = readFile(a[2], 'binary'); w = wavInfo(u);
+      print(analyze(u, w.off, w.len, w.enc, w.bits, false, w.ch));
+    } else if (a[0] === 'extract') {
+      u = readFile(a[1], 'binary'); w = wavInfo(u);
+      var c = +a[3], bytes = w.bits >> 3, frames = Math.floor(w.len / (bytes * w.ch));
+      var out = new Uint8Array(44 + frames * bytes), dv = new DataView(out.buffer);
+      var put = function (p, s) { for (var i = 0; i < 4; i++) out[p + i] = s.charCodeAt(i); };
+      put(0, 'RIFF'); dv.setUint32(4, 36 + frames * bytes, true); put(8, 'WAVE');
+      put(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, w.tag === 3 ? 3 : 1, true);
+      dv.setUint16(22, 1, true); dv.setUint32(24, w.rate, true); dv.setUint32(28, w.rate * bytes, true);
+      dv.setUint16(32, bytes, true); dv.setUint16(34, w.bits, true);
+      put(36, 'data'); dv.setUint32(40, frames * bytes, true);
+      for (var i = 0; i < frames; i++) {
+        var s = w.off + (i * w.ch + c) * bytes, d = 44 + i * bytes;
+        for (var k = 0; k < bytes; k++) out[d + k] = u[s + k];
+      }
+      writeFile(a[2], out);
+      print('ok');
+    } else if (a[0] === 'same' && a[1] === 'pcm') {
+      u = readFile(a[2], 'binary'); m = readFile(a[8], 'binary');
+      var bits = +a[5];
+      print(sameChannel(u, +a[3], +a[4], bits >> 3, +a[6], +a[7], m, +a[9], +a[10]));
+    } else if (a[0] === 'same' && a[1] === 'wav') {
+      u = readFile(a[2], 'binary'); w = wavInfo(u); m = readFile(a[4], 'binary'); mw = wavInfo(m);
+      if (mw.ch !== 1 || mw.bits !== w.bits) { print('diff'); return; }
+      print(sameChannel(u, w.off, w.len, w.bits >> 3, w.ch, +a[3], m, mw.off, mw.len));
+    } else throw new Error('mode');
+  } catch (e) {
+    print('err ' + e.message);
+  }
+}
+main(arguments);
+JAVASCRIPT
 
 # --- Jobs ------------------------------------------------------------------------
 # Analysis, in double precision: writes "ch <channels>" (not stereo),
 # "st <peak L> <R> <L-R> <L+R> <RMS L> <R> <L-R> <L+R>" (dBFS, -inf for digital
-# silence) or "err" to $tmpdir/a<n>.res
+# silence) or "err" to $tmpdir/a<n>.res. WAV / AIFF / CAF: the samples are read
+# straight from the file; FLAC: macOS decodes them to integers first.
+# jsc reads the paths it is given as ISO Latin 1: a file name with an accent or a
+# symbol (é, ●...) would not open. It is given a link with a plain name instead.
 analyze() {   # n file
-  local ch
-  ch=$("$FFPROBE" -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$2" 2>/dev/null)
-  ch=${ch%%[^0-9]*}
-  if [[ -z $ch ]]; then print err > "$tmpdir/a$1.res"; return; fi
-  if (( ch != 2 )); then print "ch $ch" > "$tmpdir/a$1.res"; return; fi
-  "$FFMPEG" -nostdin -hide_banner -nostats -i "$2" -map 0:a:0 \
-      -af "aformat=sample_fmts=dbl,pan=4c|c0=c0|c1=c1|c2=c0-c1|c3=c0+c1,astats=measure_perchannel=Peak_level+RMS_level:measure_overall=none" \
-      -f null - 2>&1 \
-    | awk '/Peak level dB/ { p[++k] = $NF }
-           /RMS level dB/  { r[++j] = $NF }
-           END { if (k < 4 || j < 4) print "err"
-                 else print "st", p[1], p[2], p[3], p[4], r[1], r[2], r[3], r[4] }' > "$tmpdir/a$1.res"
-}
-
-# Audio of one channel of SRC compared with the audio of OUT, sample by sample
-same_audio() {   # src out channel(0 = left, 1 = right)
-  local a b
-  a=$("$FFMPEG" -nostdin -v error -i "$1" -map 0:a:0 -af "pan=mono|c0=c$3" -c:a pcm_f64le -f md5 - 2>/dev/null)
-  b=$("$FFMPEG" -nostdin -v error -i "$2" -map 0:a:0 -c:a pcm_f64le -f md5 - 2>/dev/null)
-  [[ -n $a && $a == $b ]]
+  local r="" wav="$tmpdir/a$1.wav" link="$tmpdir/a$1.link"
+  local -a i
+  i=(${=infos[$1]})
+  if [[ ${i[1]} == pcm ]]; then
+    ln -sf "$2" "$link"
+    r=$("$JSC" "$jsm" -- analyze pcm "$link" ${i[5]} ${i[6]} ${i[2]} ${i[3]} ${i[4]} ${i[7]} 2>/dev/null)
+    rm -f "$link"
+  elif [[ ${i[1]} == flac && ${i[2]} == (16|24|32) ]]; then
+    afconvert_any -f WAVE -d LEI${i[2]} "$2" "$wav" && r=$("$JSC" "$jsm" -- analyze wav "$wav" 2>/dev/null)
+    rm -f "$wav"
+  fi
+  [[ $r == (st|ch)\ * ]] || r=err
+  print -r -- "$r" > "$tmpdir/a$1.res"
 }
 
 # The converted file replaces the destination only once it is complete and
@@ -464,35 +672,54 @@ install_result() {   # src out partial converted res
   rm -f "$4"
 }
 
-# WAV / AIFF / CAF: rewritten with only one channel, every other chunk kept
+# WAV / AIFF / CAF: rewritten with only one channel, every other chunk kept; the
+# audio of the new file must be exactly that channel of the original, byte for byte
 mono_pcm_job() {   # n src out partial channel
-  local conv="$tmpdir/$1.conv" res="$tmpdir/$1.res"
+  local conv="$tmpdir/$1.conv.${2:e}" res="$tmpdir/$1.res" link="$tmpdir/$1.link" r
+  local -a i o
   if ! /usr/bin/perl "$pl" mono "$2" "$conv" "$5" 2>/dev/null; then
     rm -f "$conv"; print -r -- "err unexpected file structure" > "$res"; return
   fi
-  if ! same_audio "$2" "$conv" "$5"; then
+  i=(${=infos[$1]})
+  o=(${=$(/usr/bin/perl "$pl" scan "$conv")})
+  ln -sf "$2" "$link"
+  r=$("$JSC" "$jsm" -- same pcm "$link" ${i[5]} ${i[6]} ${i[3]} ${i[7]} "$5" "$conv" ${o[5]} ${o[6]} 2>/dev/null)
+  rm -f "$link"
+  if [[ ${o[1]} != pcm || ${o[7]} != 1 || $r != ok ]]; then
     rm -f "$conv"; print -r -- "err check failed, file not written" > "$res"; return
   fi
   install_result "$2" "$3" "$4" "$conv" "$res"
 }
 
-# FLAC: re-encoded to mono FLAC (one channel), same bit depth and sample rate
+# FLAC: macOS decodes the file, jsc keeps one channel, macOS encodes it to mono FLAC
+# (same bit depth and sample rate) and the metadata blocks of the original (tags,
+# cover art...) are put back; the new file is decoded again and must be exactly that
+# channel of the original.
 mono_flac_job() {   # n src out partial bits rate channel
-  local conv="$tmpdir/$1.flac" res="$tmpdir/$1.res"
-  local -a fmt
+  local w1="$tmpdir/$1.in.wav" w2="$tmpdir/$1.mono.wav" enc="$tmpdir/$1.enc.flac"
+  local conv="$tmpdir/$1.flac" chk="$tmpdir/$1.chk.wav" res="$tmpdir/$1.res"
   case $5 in
-    16) fmt=(-sample_fmt s16) ;;
-    24) fmt=(-sample_fmt s32 -bits_per_raw_sample 24) ;;
-    32) fmt=(-sample_fmt s32 -bits_per_raw_sample 32 -strict experimental) ;;
-    *)  print -r -- "err unsupported FLAC bit depth (${5}-bit)" > "$res"; return ;;
+    16|24) ;;
+    *) print -r -- "err unsupported FLAC bit depth (${5}-bit)" > "$res"; return ;;
   esac
-  if ! "$FFMPEG" -nostdin -v error -y -i "$2" -map 0:a:0 -map '0:v?' -map_metadata 0 \
-       -c copy -c:a flac "${fmt[@]}" -ar "$6" -af "pan=mono|c0=c$7" "$conv"; then
-    rm -f "$conv"; print -r -- "err ffmpeg failed" > "$res"; return
+  if ! afconvert_any -f WAVE -d LEI$5 "$2" "$w1"; then
+    rm -f "$w1"; print -r -- "err macOS could not read the file" > "$res"; return
   fi
-  if [[ $(/usr/bin/perl "$pl" flacinfo "$conv") != "$5 $6" ]] || ! same_audio "$2" "$conv" "$7"; then
-    rm -f "$conv"; print -r -- "err check failed, file not written" > "$res"; return
+  if [[ $("$JSC" "$jsm" -- extract "$w1" "$w2" "$7" 2>/dev/null) != ok ]] \
+     || ! /usr/bin/afconvert -f flac -d flac "$w2" "$enc" 2>/dev/null; then
+    rm -f "$w1" "$w2" "$enc"; print -r -- "err FLAC encoding failed" > "$res"; return
   fi
+  rm -f "$w2"
+  if ! /usr/bin/perl "$pl" flacmerge "$2" "$enc" "$conv"; then
+    rm -f "$w1" "$enc" "$conv"; print -r -- "err unexpected file structure" > "$res"; return
+  fi
+  rm -f "$enc"
+  if [[ $(/usr/bin/perl "$pl" flacinfo "$conv") != "$5 $6" ]] \
+     || ! afconvert_any -f WAVE -d LEI$5 "$conv" "$chk" \
+     || [[ $("$JSC" "$jsm" -- same wav "$w1" "$7" "$chk" 2>/dev/null) != ok ]]; then
+    rm -f "$w1" "$chk" "$conv"; print -r -- "err check failed, file not written" > "$res"; return
+  fi
+  rm -f "$w1" "$chk"
   install_result "$2" "$3" "$4" "$conv" "$res"
 }
 
@@ -1932,8 +2159,11 @@ for (( n = 1; n <= ${#files}; n++ )); do
   pids+=($!)
   if (( ${#pids} >= maxjobs )); then wait ${pids[1]}; shift pids; fi
 done
-wait ${pids[@]} 2>/dev/null
-progress_stop
+wait_all ${pids[@]}
+# The progress window stays up ("Preparing the results…") until the window with the
+# results opens: that window removes the progress file as it appears.
+progress_set 1 1 "Preparing the results…" ""
+export AQA_PROGRESS="$tmpdir/progress"
 cancelled && exit 0
 
 # --- 2. Results --------------------------------------------------------------------
@@ -1947,8 +2177,61 @@ nopt=0         # files with a "Convert to mono" box
 # Several files selected: only the files with something to do are listed
 batch=$(( ${#files} > 1 || folders > 0 ))
 n_mono=0 n_stereo=0 n_other=0 n_lossy=0   # files left out of the list
+# Every analysis result is classified in a single awk run (one run per file would
+# take several seconds on folders of thousands of files): "<n> TAB <result>".
+typeset -A classes
 for (( n = 1; n <= ${#files}; n++ )); do
-  name=${labels[n]}
+  info=(${=infos[n]})
+  case ${info[1]} in
+    pcm)  bits=${info[3]}; [[ ${info[2]} == floating-point ]] && bits=24 ;;
+    flac) bits=${info[2]} ;;
+    *)    continue ;;
+  esac
+  r=""
+  [[ -f $tmpdir/a$n.res ]] && r=$(<"$tmpdir/a$n.res")
+  print -r -- "$n $bits $r"
+done | awk -v steps="$dither_steps" '
+
+    function db(x) { return x == "-inf" ? -1000 : x + 0 }
+    function lin(x) { return x <= -1000 ? 0 : 10 ^ (x / 20) }
+    function abs(x) { return x < 0 ? -x : x }
+    function classify(   keepl, keepr, l, r, d, s, thr, rl, rr, rd, rs, rho, res, bal, below) {
+      if ($1 == "ch") {
+        if ($2 == 1) return "info\tMono\tAlready a mono file"
+        return "info\t" $2 " channels\tNot a stereo file"
+      }
+      if ($1 == "st") {
+        keepl = "Convert to mono (keep the left channel"; keepr = "Convert to mono (keep the right channel"
+        l = db($2); r = db($3); d = db($4); s = db($5)
+        thr = 20 * log(steps / 2 ^ (bits - 1)) / log(10); if (thr > -60) thr = -60
+        if (l <= -1000 && r <= -1000) { return "info\tSilent\tBoth channels are silent" }
+        if (d <= -1000) { return "fake\t100% Mono\tMono file disguised as a stereo file\t\t0" }
+        if (d <= thr) { return "fake\t100% Mono\tMono file disguised as a stereo file, apart from an inaudible dither noise\t\t0" }
+        if (s <= thr) { return "opt\tFake Mono\tMono signal, one channel with inverted polarity\t" keepl ")\t0" }
+        if (r <= -1000) { return "opt\tLeft channel only\tThe right channel is silent\t" keepl ")\t0" }
+        if (l <= -1000) { return "opt\tRight channel only\tThe left channel is silent\t" keepr ")\t1" }
+        rl = lin($6); rr = lin($7); rd = lin($8); rs = lin($9)
+        rho = (rl > 0 && rr > 0) ? (rs * rs - rd * rd) / (4 * rl * rr) : 0
+        res = 1 - rho * rho; if (res < 1e-30) res = 1e-30
+        bal = db($6) - db($7)
+        below = (db($6) > db($7) ? db($6) : db($7)) - db($8)   # difference vs. signal (RMS)
+        # 99.9% Mono: the difference stays at least 40 dB under the signal (1% in level)
+        if (10 * log(res) / log(10) <= -50) {
+          if (rho < 0) return "opt\tFake Mono\tMono signal, one channel with inverted polarity\t" keepl ")\t0"
+          else if (abs(bal) >= 0.1)
+            return sprintf("opt\tFake Mono\tMono signal panned to the %s (the %s channel is %.1f dB louder)\t%s\t%d", (bal > 0 ? "left" : "right"), (bal > 0 ? "left" : "right"), abs(bal), (bal > 0 ? keepl ", the louder one)" : keepr ", the louder one)"), (bal > 0 ? 0 : 1))
+          else return sprintf("opt\t99.9%% Mono\tPractically mono: the difference between the channels is %.0f dB below the signal\t%s)\t0", below, keepl)
+        }
+        if (below >= 40) { return sprintf("opt\t99.9%% Mono\tPractically mono: the difference between the channels is %.0f dB below the signal\t%s)\t0", below, keepl) }
+        return "info\tReal stereo\t"
+      }
+      return "err"
+    }
+    { n = $1; bits = $2; sub(/^[^ ]+ [^ ]+ ?/, ""); print n "\t" classify() }' > "$tmpdir/classes"
+while IFS= read -r line; do classes[${line%%$'\t'*}]=${line#*$'\t'}; done < "$tmpdir/classes"
+
+for (( n = 1; n <= ${#files}; n++ )); do
+  name=${files[n]:t}              # the window shows the file name only (no folder path)
   r=""
   [[ -f $tmpdir/a$n.res ]] && r=$(<"$tmpdir/a$n.res")
   info=(${=infos[n]})
@@ -1964,43 +2247,7 @@ for (( n = 1; n <= ${#files}; n++ )); do
   # steps of the file's resolution). Panned or inverted mono is reported, not
   # converted. The correlation of the channels comes from the RMS levels:
   # sum(L.R) = (rms(L+R)^2 - rms(L-R)^2) / 4.
-  out=$(print -r -- "$r" | awk -v bits="$bits" -v steps="$dither_steps" '
-    function db(x) { return x == "-inf" ? -1000 : x + 0 }
-    function lin(x) { return x <= -1000 ? 0 : 10 ^ (x / 20) }
-    function abs(x) { return x < 0 ? -x : x }
-    $1 == "ch" {
-      if ($2 == 1) print "info\tMono\tAlready a mono file"
-      else         print "info\t" $2 " channels\tNot a stereo file"
-      exit
-    }
-    $1 == "st" {
-      keepl = "Convert to mono (keep the left channel"; keepr = "Convert to mono (keep the right channel"
-      l = db($2); r = db($3); d = db($4); s = db($5)
-      thr = 20 * log(steps / 2 ^ (bits - 1)) / log(10); if (thr > -60) thr = -60
-      if (l <= -1000 && r <= -1000) { print "info\tSilent\tBoth channels are silent"; exit }
-      if (d <= -1000) { print "fake\t100% Mono\tMono file disguised as a stereo file\t\t0"; exit }
-      if (d <= thr) { print "fake\t100% Mono\tMono file disguised as a stereo file, apart from an inaudible dither noise\t\t0"; exit }
-      if (s <= thr) { print "opt\tFake Mono\tMono signal, one channel with inverted polarity\t" keepl ")\t0"; exit }
-      if (r <= -1000) { print "opt\tLeft channel only\tThe right channel is silent\t" keepl ")\t0"; exit }
-      if (l <= -1000) { print "opt\tRight channel only\tThe left channel is silent\t" keepr ")\t1"; exit }
-      rl = lin($6); rr = lin($7); rd = lin($8); rs = lin($9)
-      rho = (rl > 0 && rr > 0) ? (rs * rs - rd * rd) / (4 * rl * rr) : 0
-      res = 1 - rho * rho; if (res < 1e-30) res = 1e-30
-      bal = db($6) - db($7)
-      below = (db($6) > db($7) ? db($6) : db($7)) - db($8)   # difference vs. signal (RMS)
-      # 99.9% Mono: the difference stays at least 40 dB under the signal (1% in level)
-      if (10 * log(res) / log(10) <= -50) {
-        if (rho < 0) print "opt\tFake Mono\tMono signal, one channel with inverted polarity\t" keepl ")\t0"
-        else if (abs(bal) >= 0.1)
-          printf "opt\tFake Mono\tMono signal panned to the %s (the %s channel is %.1f dB louder)\t%s\t%d\n", (bal > 0 ? "left" : "right"), (bal > 0 ? "left" : "right"), abs(bal), (bal > 0 ? keepl ", the louder one)" : keepr ", the louder one)"), (bal > 0 ? 0 : 1)
-        else printf "opt\t99.9%% Mono\tPractically mono: the difference between the channels is %.0f dB below the signal\t%s)\t0\n", below, keepl
-        exit
-      }
-      if (below >= 40) { printf "opt\t99.9%% Mono\tPractically mono: the difference between the channels is %.0f dB below the signal\t%s)\t0\n", below, keepl; exit }
-      print "info\tReal stereo\t"
-      exit
-    }
-    { print "err" }')
+  out=${classes[$n]}
   if [[ -z $out || $out == err ]]; then
     specs+=("${name}"$'\n'"!Not an audio file, or unreadable"); spec_file+=(0)
     continue
@@ -2067,6 +2314,7 @@ property centerValue : 1
 property centeredStyle : missing value
 property redColor : missing value
 property yellowColor : missing value
+property nameColor : missing value
 property logo : missing value
 property lastHeight : 0
 property optionBoxes : {}
@@ -2115,9 +2363,17 @@ on plainWindow(fileSpecs, summaryText, overText, dupText)
 	set msg to msg & linefeed & summaryText
 	try
 		if overText is "" then
+			-- the progress window ("Preparing the results…") closes when this window opens
+			try
+				(current application's NSFileManager's defaultManager())'s removeItemAtPath:((current application's NSProcessInfo's processInfo()'s environment())'s objectForKey:"AQA_PROGRESS") |error|:(missing value)
+			end try
 			display dialog msg with title "Find Mono" buttons {"OK"} default button "OK"
 			return ""
 		end if
+		-- the progress window ("Preparing the results…") closes when this window opens
+		try
+			(current application's NSFileManager's defaultManager())'s removeItemAtPath:((current application's NSProcessInfo's processInfo()'s environment())'s objectForKey:"AQA_PROGRESS") |error|:(missing value)
+		end try
 		set d to display dialog (msg & linefeed & linefeed & overText & linefeed & linefeed & dupText) with title "Find Mono" buttons {"Overwrite", "Duplicate", "Cancel"} default button "Overwrite" cancel button "Cancel"
 	on error
 		return ""
@@ -2129,6 +2385,8 @@ on setupStyle(iconPath)
 	set ca to current application
 	set my redColor to ca's NSColor's colorWithSRGBRed:0.94 green:0.58 blue:0.47 alpha:1.0
 	set my yellowColor to ca's NSColor's colorWithSRGBRed:0.78 green:0.72 blue:0.48 alpha:0.85
+	-- file names: a soft, slightly warm white, quieter than the white of the values
+	set my nameColor to ca's NSColor's colorWithSRGBRed:0.78 green:0.77 blue:0.74 alpha:1.0
 	-- NSTextAlignmentCenter is 1 on Apple Silicon and 2 on Intel Macs
 	if (do shell script "/usr/bin/uname -m") is "x86_64" then
 		set my centerValue to 2
@@ -2270,7 +2528,7 @@ on fileBlock(spec, textWidth, specIndex)
 	set lns to paragraphs of spec
 	set parts to {}
 	set heights to {}
-	set end of parts to my lineLabel(item 1 of lns, true, 15, my yellowColor, textWidth)
+	set end of parts to my lineLabel(item 1 of lns, true, 15, my nameColor, textWidth)
 	set end of heights to my lastHeight
 	if (item 2 of lns) starts with "!" then
 		set end of parts to my lineLabel(text 2 thru -1 of (item 2 of lns), false, 14, my yellowColor, textWidth)
@@ -2464,6 +2722,10 @@ on showWindow(fileSpecs, summaryText, overText, dupText)
 	end try
 	ca's NSApplication's sharedApplication()'s activateIgnoringOtherApps:true
 	set my windowShown to true
+	-- the progress window ("Preparing the results…") closes when this window opens
+	try
+		(current application's NSFileManager's defaultManager())'s removeItemAtPath:((current application's NSProcessInfo's processInfo()'s environment())'s objectForKey:"AQA_PROGRESS") |error|:(missing value)
+	end try
 	set response to (theAlert's runModal()) as integer
 	if overText is "" or response > 1001 then return ""
 	set ticked to ""
@@ -2480,6 +2742,7 @@ APPLESCRIPT
 
 answer=$(/usr/bin/osascript "$tmpdir/dialog.applescript" "$tmpdir/icon.png" "$summary" \
   "$over_text" "$dup_text" "${specs[@]}" 2>/dev/null)
+progress_stop
 case ${answer%%$'\n'*} in
   Overwrite) mode=overwrite ;;
   Duplicate) mode=duplicate ;;
@@ -2527,7 +2790,7 @@ for n in "${todo[@]}"; do
   pids+=($!)
   if (( ${#pids} >= maxjobs )); then wait ${pids[1]}; shift pids; fi
 done
-wait ${pids[@]} 2>/dev/null
+wait_all ${pids[@]}
 progress_stop
 
 # --- 5. Summary ------------------------------------------------------------------------
